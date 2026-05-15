@@ -175,7 +175,8 @@ board-preview-app {
   top: 0;
   left: 0;
   right: 0;
-  z-index: 100;
+  z-index: 1000;
+  isolation: isolate;
   display: flex;
   flex-direction: column;
   gap: 0.4rem;
@@ -202,6 +203,104 @@ board-preview-app {
 .bp-app__sticky-row--tags {
   border-top: 1px dashed rgba(255, 255, 255, 0.06);
   padding-top: 0.4rem;
+}
+
+.bp-app__jump-bar {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem 0.75rem;
+  align-items: center;
+  margin-top: 0.65rem;
+  padding: 0.55rem 0.75rem;
+  background: var(--bp-panel);
+  border: 1px solid var(--bp-border);
+  border-radius: 10px;
+}
+
+.bp-app__jump-hint {
+  flex: 1 1 auto;
+  min-width: 0;
+  font-size: 0.78rem;
+  color: var(--bp-muted);
+}
+
+.bp-jump {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35rem;
+  padding: 0.2rem 0.5rem;
+  font-size: 0.8rem;
+  color: var(--bp-muted);
+  background: rgba(255, 255, 255, 0.04);
+  border: 1px solid var(--bp-border);
+  border-radius: 8px;
+}
+
+.bp-jump--sticky {
+  margin-left: auto;
+}
+
+.bp-jump__label,
+.bp-jump__total {
+  white-space: nowrap;
+}
+
+.bp-jump__total {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  color: var(--bp-muted);
+}
+
+.bp-jump__input {
+  width: 4.5rem;
+  padding: 0.25rem 0.4rem;
+  font-size: 0.82rem;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  color: var(--bp-text);
+  background: var(--bp-bg);
+  border: 1px solid var(--bp-border);
+  border-radius: 6px;
+}
+
+.bp-jump__input:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+
+.bp-jump__input--err {
+  border-color: var(--bp-danger);
+  background: rgba(248, 81, 73, 0.08);
+  animation: bp-jump-shake 0.32s ease-in-out;
+}
+
+@keyframes bp-jump-shake {
+  0%, 100% {
+    transform: translateX(0);
+  }
+  25% {
+    transform: translateX(-3px);
+  }
+  75% {
+    transform: translateX(3px);
+  }
+}
+
+@keyframes bp-jump-flash {
+  0% {
+    box-shadow: 0 0 0 0 rgba(63, 185, 80, 0);
+    border-color: var(--bp-border);
+  }
+  25% {
+    box-shadow: 0 0 0 4px rgba(63, 185, 80, 0.55);
+    border-color: var(--bp-accent);
+  }
+  100% {
+    box-shadow: 0 0 0 0 rgba(63, 185, 80, 0);
+    border-color: var(--bp-border);
+  }
+}
+
+.bp-jump-flash {
+  animation: bp-jump-flash 1.4s ease-out;
 }
 
 .bp-app__sticky-tags-label {
@@ -292,6 +391,9 @@ board-preview-app {
 
 board-preview-cell {
   display: block;
+  position: relative;
+  z-index: 0;
+  isolation: isolate;
   padding: 0.85rem 1rem;
   background: var(--bp-panel);
   border: 1px solid var(--bp-border);

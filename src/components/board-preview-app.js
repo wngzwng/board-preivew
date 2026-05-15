@@ -1,10 +1,5 @@
 import './board-preview-cell.js';
-import {
-  serializeExportBundle,
-  readBundleFromFile,
-  downloadTextFile,
-  readTextFileUtf8,
-} from '../io/bundle.js';
+import { downloadTextFile, readTextFileUtf8 } from '../io/bundle.js';
 import {
   parseCsv,
   serializeExportCsv,
@@ -59,6 +54,31 @@ export class BoardPreviewApp extends HTMLElement {
     );
   }
 
+  /**
+   * 渲染一个跳转组 HTML 片段，所有跳转入口（页头/sticky）共用。
+   * @param {'header' | 'sticky'} variant
+   */
+  _jumpGroupHtml(variant) {
+    return `
+      <span class="bp-jump bp-jump--${variant}" role="group" aria-label="快速跳转">
+        <span class="bp-jump__label">跳到 #</span>
+        <input
+          type="number"
+          class="bp-jump__input"
+          min="1"
+          step="1"
+          inputmode="numeric"
+          placeholder="序号"
+          autocomplete="off"
+          data-role="jump-input"
+          aria-label="跳转到指定序号"
+        />
+        <span class="bp-jump__total" data-role="jump-total">/ 0</span>
+        <button type="button" class="bp-btn bp-btn--sm" data-action="jump-to">跳转</button>
+      </span>
+    `;
+  }
+
   connectedCallback() {
     this.innerHTML = `
       <header class="bp-app__header">
@@ -66,12 +86,6 @@ export class BoardPreviewApp extends HTMLElement {
         <p class="bp-app__sub">羊了个羊式叠层 · 多预览框 · 资源见 <code>src/assets/</code></p>
         <div class="bp-app__actions">
           <button type="button" class="bp-btn bp-btn--primary" data-action="add-cell">＋ 预览框</button>
-          <label class="bp-btn bp-file">
-            导入 JSON
-            <input type="file" class="bp-app__file" accept="application/json,.json" data-role="json-file" hidden />
-          </label>
-          <button type="button" class="bp-btn" data-action="export-all">全部导出 JSON</button>
-          <button type="button" class="bp-btn" data-action="export-tag">按标签导出 JSON…</button>
         </div>
         <div class="bp-app__csv" aria-label="CSV 导入导出">
           <span class="bp-app__csv-hint">CSV：选择文件后<strong>自动读取表头</strong>，在下方选择关卡串所在列；默认选中 <code>${DEFAULT_CONTENT_COLUMN}</code> 列（不区分大小写）。</span>
@@ -101,6 +115,10 @@ export class BoardPreviewApp extends HTMLElement {
             </label>
           </div>
         </div>
+        <div class="bp-app__jump-bar" aria-label="快速跳转">
+          ${this._jumpGroupHtml('header')}
+          <span class="bp-app__jump-hint">输入序号后按 Enter 或点「跳转」，目标会尽量滚动到视口中央</span>
+        </div>
         <div class="bp-app__tags" aria-label="预设标签">
           <label class="bp-app__tags-field">
             <span class="bp-app__tags-label">预设标签</span>
@@ -123,11 +141,6 @@ export class BoardPreviewApp extends HTMLElement {
         <div class="bp-app__sticky-row">
           <button type="button" class="bp-btn bp-btn--primary" data-action="add-cell">＋ 预览框</button>
           <label class="bp-btn bp-file">
-            导入 JSON
-            <input type="file" class="bp-app__file-sticky" accept="application/json,.json" data-role="json-file" hidden />
-          </label>
-          <button type="button" class="bp-btn" data-action="export-all">全部导出 JSON</button>
-          <label class="bp-btn bp-file">
             选择 CSV
             <input type="file" class="bp-app__csv-file-sticky" accept=".csv,text/csv" data-role="csv-file" hidden />
           </label>
@@ -137,6 +150,7 @@ export class BoardPreviewApp extends HTMLElement {
             <input type="checkbox" class="bp-csv-export-index" data-role="index-toggle" />
             Index 列
           </label>
+          ${this._jumpGroupHtml('sticky')}
         </div>
         <div class="bp-app__sticky-row bp-app__sticky-row--tags">
           <span class="bp-app__sticky-tags-label">预设标签</span>
@@ -160,6 +174,7 @@ export class BoardPreviewApp extends HTMLElement {
     this.addEventListener('click', (e) => this._onDelegatedClick(e));
     this.addEventListener('change', (e) => this._onDelegatedChange(e));
     this.addEventListener('input', (e) => this._onDelegatedInput(e));
+    this.addEventListener('keydown', (e) => this._onDelegatedKeydown(e));
 
     this._initObserver();
     this._initStickyBar();
@@ -179,12 +194,6 @@ export class BoardPreviewApp extends HTMLElement {
       case 'add-cell':
         this.addCell();
         break;
-      case 'export-all':
-        this.exportAll();
-        break;
-      case 'export-tag':
-        this.exportByTag();
-        break;
       case 'confirm-csv-import':
         this._confirmCsvImport();
         break;
@@ -197,7 +206,20 @@ export class BoardPreviewApp extends HTMLElement {
       case 'export-csv-tag':
         this.exportCsvByTag();
         break;
+      case 'jump-to':
+        this._jumpFromInput(btn);
+        break;
       default:
+    }
+  }
+
+  /** @param {KeyboardEvent} e */
+  _onDelegatedKeydown(e) {
+    const t = /** @type {HTMLElement | null} */ (e.target);
+    if (!t) return;
+    if (e.key === 'Enter' && t.dataset?.role === 'jump-input') {
+      e.preventDefault();
+      this._jumpFromInput(t);
     }
   }
 
@@ -206,9 +228,7 @@ export class BoardPreviewApp extends HTMLElement {
     const t = /** @type {HTMLElement | null} */ (e.target);
     if (!t) return;
     const role = t.dataset?.role;
-    if (role === 'json-file') {
-      this._onImportFile(/** @type {HTMLInputElement} */ (t));
-    } else if (role === 'csv-file') {
+    if (role === 'csv-file') {
       this._onCsvFileChosen(/** @type {HTMLInputElement} */ (t));
     } else if (role === 'index-toggle') {
       this._syncIndexToggles(/** @type {HTMLInputElement} */ (t));
@@ -429,6 +449,7 @@ export class BoardPreviewApp extends HTMLElement {
   }
 
   _renderStatus() {
+    this._refreshJumpUi();
     const el = /** @type {HTMLDivElement | null} */ (
       this.querySelector('.bp-app__grid-info')
     );
@@ -442,6 +463,164 @@ export class BoardPreviewApp extends HTMLElement {
     }
     el.hidden = false;
     el.textContent = `共 ${total} 个预览框 · 已渲染 ${hydrated} 个（继续滚动以加载更多）`;
+  }
+
+  /** 同步所有跳转组的总数显示、输入框 max 上限与禁用状态 */
+  _refreshJumpUi() {
+    const total = this._entries.length;
+    this.querySelectorAll('[data-role="jump-total"]').forEach((el) => {
+      el.textContent = `/ ${total}`;
+    });
+    this.querySelectorAll('input[data-role="jump-input"]').forEach((node) => {
+      const input = /** @type {HTMLInputElement} */ (node);
+      if (total > 0) {
+        input.max = String(total);
+        input.disabled = false;
+      } else {
+        input.removeAttribute('max');
+        input.disabled = true;
+        input.value = '';
+      }
+    });
+    this.querySelectorAll('button[data-action="jump-to"]').forEach((node) => {
+      const btn = /** @type {HTMLButtonElement} */ (node);
+      btn.disabled = total === 0;
+    });
+  }
+
+  /**
+   * 从触发源（按钮或输入框）所在的跳转组里取序号并跳转。
+   * @param {HTMLElement | null} source
+   */
+  _jumpFromInput(source) {
+    const group = source?.closest?.('.bp-jump') ?? this.querySelector('.bp-jump');
+    const input = /** @type {HTMLInputElement | null} */ (
+      group?.querySelector('input[data-role="jump-input"]') ?? null
+    );
+    if (!input) return;
+    const raw = input.value.trim();
+    const total = this._entries.length;
+    if (!raw) {
+      this._reportJumpError(input, '请输入要跳转到的序号');
+      return;
+    }
+    const seq = Number.parseInt(raw, 10);
+    if (!Number.isFinite(seq) || !Number.isInteger(seq)) {
+      this._reportJumpError(input, '请输入有效的整数序号');
+      return;
+    }
+    if (total === 0) {
+      this._reportJumpError(input, '当前没有任何预览框');
+      return;
+    }
+    if (seq < 1 || seq > total) {
+      this._reportJumpError(input, `请输入 1 到 ${total} 之间的序号`);
+      return;
+    }
+    this.jumpTo(seq);
+  }
+
+  /**
+   * @param {HTMLInputElement} input
+   * @param {string} message
+   */
+  _reportJumpError(input, message) {
+    input.classList.remove('bp-jump__input--err');
+    void input.offsetWidth;
+    input.classList.add('bp-jump__input--err');
+    input.title = message;
+    input.focus({ preventScroll: true });
+    input.select();
+    window.setTimeout(() => {
+      input.classList.remove('bp-jump__input--err');
+      input.title = '';
+    }, 1200);
+  }
+
+  /**
+   * 跳转到第 seq 条预览框（1 起），尽量将其滚动到视口中央。
+   *
+   * 关键：骨架与真实 cell 的高度不同。若 smooth scroll 过程中懒加载
+   * Observer 把目标之前的骨架水合，前置元素会"长高"，把目标 cell 往下挤，
+   * 导致最终位置严重偏离视口中央。
+   *
+   * 这里采取「暂停懒加载 → 仅水合目标本身 → 滚动 → 等动画完成再恢复
+   * 懒加载」的策略：滚动期间布局完全冻结，目标 cell 在 DOM 中的实际位置
+   * 等于其骨架占位的位置，scrollIntoView 能精确落到视口中央。
+   * @param {number} seq
+   */
+  jumpTo(seq) {
+    const total = this._entries.length;
+    if (!Number.isInteger(seq) || seq < 1 || seq > total) return;
+    const entry = this._entries[seq - 1];
+    if (!entry) return;
+
+    this._suspendLazyHydration();
+
+    const justHydrated = !entry.cellEl;
+    if (justHydrated) this._hydrateEntry(entry);
+
+    const scrollAndFlash = () => {
+      const target = /** @type {HTMLElement | null} */ (entry.el);
+      if (!target?.scrollIntoView) {
+        this._resumeLazyHydration();
+        return;
+      }
+      target.scrollIntoView({ block: 'center', behavior: 'smooth' });
+      this._flashTarget(target);
+      // 滚动动画约 300~600ms，留出余量后再恢复懒加载
+      this._scheduleResumeLazyHydration(800);
+    };
+
+    if (justHydrated) {
+      requestAnimationFrame(() => requestAnimationFrame(scrollAndFlash));
+    } else {
+      requestAnimationFrame(scrollAndFlash);
+    }
+  }
+
+  /** 暂停懒加载 Observer，防止跳转期间布局被骨架水合扰动 */
+  _suspendLazyHydration() {
+    if (this._resumeHydrationTimer != null) {
+      window.clearTimeout(this._resumeHydrationTimer);
+      this._resumeHydrationTimer = null;
+    }
+    if (this._observer) {
+      this._observer.disconnect();
+      this._observer = null;
+    }
+  }
+
+  /** @param {number} delayMs */
+  _scheduleResumeLazyHydration(delayMs) {
+    if (this._resumeHydrationTimer != null) {
+      window.clearTimeout(this._resumeHydrationTimer);
+    }
+    this._resumeHydrationTimer = window.setTimeout(() => {
+      this._resumeHydrationTimer = null;
+      this._resumeLazyHydration();
+    }, delayMs);
+  }
+
+  /** 重新启用懒加载，并把当前所有未水合骨架重新挂上 Observer */
+  _resumeLazyHydration() {
+    if (this._observer) return;
+    this._initObserver();
+    if (!this._observer) return;
+    for (const e of this._entries) {
+      if (!e.cellEl) this._observer.observe(e.el);
+    }
+  }
+
+  /** @param {HTMLElement} target */
+  _flashTarget(target) {
+    target.classList.remove('bp-jump-flash');
+    // 触发重绘，确保动画能重启
+    void target.offsetWidth;
+    target.classList.add('bp-jump-flash');
+    window.setTimeout(() => {
+      target.classList.remove('bp-jump-flash');
+    }, 1500);
   }
 
   _broadcastPredefinedTags() {
@@ -470,33 +649,6 @@ export class BoardPreviewApp extends HTMLElement {
         item: { ...e.item },
       };
     });
-  }
-
-  exportAll() {
-    const items = this._effectiveEntries().map((e) => e.item);
-    const text = serializeExportBundle(items);
-    downloadTextFile(text, 'board-preview-export.json');
-  }
-
-  exportByTag() {
-    const tag = window.prompt('要包含的标签（任一匹配即导出该预览框）:', '');
-    if (tag === null) return;
-    const needle = tag.trim();
-    if (!needle) {
-      window.alert('未输入标签。');
-      return;
-    }
-    const items = this._effectiveEntries()
-      .map((e) => e.item)
-      .filter((item) =>
-        Array.isArray(item.tags) && item.tags.some((t) => t.includes(needle)),
-      );
-    if (!items.length) {
-      window.alert('没有带该标签的预览框。');
-      return;
-    }
-    const text = serializeExportBundle(items);
-    downloadTextFile(text, `board-preview-${needle}.json`);
   }
 
   /** @returns {import('../io/csv.js').ExportEntry[]} */
@@ -691,26 +843,6 @@ export class BoardPreviewApp extends HTMLElement {
     }
   }
 
-  /** @param {HTMLInputElement} input */
-  async _onImportFile(input) {
-    const file = input.files?.[0];
-    input.value = '';
-    if (!file) return;
-    try {
-      const bundle = await readBundleFromFile(file);
-      this._csvHeader = null;
-      this._csvColumnCount = 0;
-      this._resetEntries();
-      for (const item of bundle.items) {
-        this._addLazyEntry(item, null);
-      }
-      this._refreshSequenceBadges();
-      this._renderStatus();
-    } catch (e) {
-      const msg = e instanceof Error ? e.message : String(e);
-      window.alert(`导入失败：${msg}`);
-    }
-  }
 }
 
 customElements.define('board-preview-app', BoardPreviewApp);
