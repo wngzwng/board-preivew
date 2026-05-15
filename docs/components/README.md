@@ -6,5 +6,5 @@
 |------|------|------|
 | [编解码组件](codec.md) | 关卡字符串 ↔ 结构化数据 | 解析 `level_str`、坐标与花色、分隔规则、与 `format.py` 的对应关系 |
 | [导入导出组件](io.md) | 文件读写与导出包 | 导入校验、按标签/全部导出、操作记录与元数据 |
-| [Board 操作集](board-operations.md) | 几何变换与回放 | 左右旋转、XY 镜像、Z 轴反转及导出 `operations` 约定 |
+| [Board 操作集](board-operations.md) | 几何变换与回放 | 左右旋转 / XY 镜像 / Z 轴反转的公式、2×2 占格与锚点重整、`(z,x,y)` 后置排序、`operations` 记录与回放、`hadZAxisOperation` 单调升、CSV 四列附加 |
 | [渲染与预览组件](render.md) | 网格布局与单框交互 | CSS Grid、工具条、与编解码的状态同步 |

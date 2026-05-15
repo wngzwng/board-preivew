@@ -59,7 +59,7 @@
 各模块的职责、数据流、接口约定与错误处理见 **`docs/components/`**：
 
 - [组件文档索引](components/README.md)
-- [Board 操作集](components/board-operations.md)（左右旋转、XY 镜像、Z 轴反转与导出 `operations` 约定）
+- [Board 操作集](components/board-operations.md)（左右旋转 / XY 镜像 / Z 轴反转的公式、2×2 占格与锚点重整、`(z,x,y)` 后置排序、`operations` 记录与回放、`hadZAxisOperation` 单调升、CSV 四列附加）
 
 ## 技术栈
 
