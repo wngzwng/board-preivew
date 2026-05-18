@@ -7,6 +7,7 @@ import {
   serializeExportCsv,
   APPENDED_EXPORT_COLUMNS,
   INDEX_COLUMN_NAME,
+  TAGS_COLUMN_NAME,
   getColumnLabelsFromRows,
   defaultContentColumnIndex,
 } from '../src/io/csv.js';
@@ -44,7 +45,7 @@ test('表头列名', () => {
   assert.deepEqual(extractLevelStringsFromRows(rows, spec), ['AAA', 'BBB']);
 });
 
-test('导出 CSV：保留原始列 + 追加新 4 列', () => {
+test('导出 CSV：保留原始列 + 追加新 4 列（识别到 tags 列时覆盖该列，避免回环导入列重复）', () => {
   const csv = serializeExportCsv({
     header: ['id', 'tags', 'Content'],
     entries: [
@@ -64,6 +65,7 @@ test('导出 CSV：保留原始列 + 追加新 4 列', () => {
       },
     ],
     operatorOf: operationsToGlyphString,
+    tagsColumnIndex: 1,
   });
   assert.ok(csv.startsWith('\uFEFF'));
   const rows = parseCsv(csv);
@@ -79,6 +81,36 @@ test('导出 CSV：保留原始列 + 追加新 4 列', () => {
   assert.equal(rows[1][4], 'LX');
   assert.equal(rows[1][5], '002,20,2,4,4.82');
   assert.equal(rows[1][6], '0');
+});
+
+test('导出 CSV：未识别到 tags 列时在原始列后追加 Tags 列', () => {
+  const csv = serializeExportCsv({
+    header: ['id', 'Content'],
+    entries: [
+      {
+        originalRow: ['1', 'lv'],
+        item: {
+          id: '1',
+          tags: ['easy', 'wip'],
+          sourceLevelStr: 'src',
+          levelStr: 'tgt',
+          operations: [],
+          meta: { hadZAxisOperation: false },
+        },
+      },
+    ],
+    operatorOf: operationsToGlyphString,
+  });
+  const rows = parseCsv(csv);
+  assert.deepEqual(rows[0], [
+    'id',
+    'Content',
+    TAGS_COLUMN_NAME,
+    ...APPENDED_EXPORT_COLUMNS,
+  ]);
+  assert.equal(rows[1][0], '1');
+  assert.equal(rows[1][1], 'lv');
+  assert.equal(rows[1][2], 'easy|wip');
 });
 
 test('导出 CSV：无原始 CSV 时退化为占位列', () => {
@@ -102,8 +134,8 @@ test('导出 CSV：无原始 CSV 时退化为占位列', () => {
   });
   const body = csv.replace(/^\uFEFF/, '');
   const [header, row] = body.split('\r\n');
-  assert.equal(header, APPENDED_EXPORT_COLUMNS.join(','));
-  assert.equal(row, 'src,Z,tgt,1');
+  assert.equal(header, [TAGS_COLUMN_NAME, ...APPENDED_EXPORT_COLUMNS].join(','));
+  assert.equal(row, ',src,Z,tgt,1');
 });
 
 test('导出 CSV：可选 Index 列（1 起自增，且在原始列之前）', () => {
@@ -129,6 +161,7 @@ test('导出 CSV：可选 Index 列（1 起自增，且在原始列之前）', (
     INDEX_COLUMN_NAME,
     'id',
     'Content',
+    TAGS_COLUMN_NAME,
     ...APPENDED_EXPORT_COLUMNS,
   ]);
   assert.deepEqual(

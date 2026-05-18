@@ -9,6 +9,7 @@ import {
   BOARD_OP_GLYPH_LEGEND,
 } from '../board/operationGlyphs.js';
 import { tileAssetPaths } from '../assets/tileSources.js';
+import { tagHue } from '../utils/tagColor.js';
 
 export class BoardPreviewCell extends HTMLElement {
   constructor() {
@@ -161,6 +162,7 @@ export class BoardPreviewCell extends HTMLElement {
             <button type="button" class="bp-btn bp-btn--sm" data-action="copy-level">复制</button>
             <button type="button" class="bp-btn bp-btn--sm" data-action="paste-level">粘贴</button>
             <button type="button" class="bp-btn bp-btn--sm" data-action="reset-level" aria-label="重置为原始关卡">重置</button>
+            <button type="button" class="bp-btn bp-btn--sm" data-action="download-png" aria-label="下载 PNG 图片">下载 PNG</button>
           </div>
         </div>
       </header>
@@ -169,7 +171,6 @@ export class BoardPreviewCell extends HTMLElement {
           <span class="bp-cell__label-text">标签</span>
           <select class="bp-cell__tags-add" aria-label="添加标签">
             <option value="" hidden>+ 添加</option>
-            <option value="__custom__">自定义…</option>
           </select>
         </div>
         <div class="bp-cell__tags-chips" role="list"></div>
@@ -252,9 +253,10 @@ export class BoardPreviewCell extends HTMLElement {
     );
 
     this._decodeBtn.addEventListener('click', () => this.applyDecode(true));
-    const hdrSide = this.querySelector('.bp-cell__hdr-side');
-    hdrSide?.addEventListener('click', (e) => {
-      const btn = /** @type {HTMLElement} */ (e.target).closest('[data-action]');
+    this.addEventListener('click', (e) => {
+      const btn = /** @type {HTMLElement | null} */ (
+        /** @type {HTMLElement} */ (e.target).closest('[data-action]')
+      );
       if (!btn || !this.contains(btn)) return;
       const act = btn.dataset.action;
       if (act === 'copy-level') {
@@ -263,6 +265,8 @@ export class BoardPreviewCell extends HTMLElement {
         void this._pasteLevelStr();
       } else if (act === 'reset-level') {
         this._resetToOriginalLevel();
+      } else if (act === 'download-png') {
+        void this._downloadBoardPng();
       }
     });
     this._toolsEl.addEventListener('click', (e) => {
@@ -367,10 +371,6 @@ export class BoardPreviewCell extends HTMLElement {
       }
       sel.appendChild(grp);
     }
-    const custom = document.createElement('option');
-    custom.value = '__custom__';
-    custom.textContent = '自定义…';
-    sel.appendChild(custom);
     sel.value = '';
   }
 
@@ -388,6 +388,7 @@ export class BoardPreviewCell extends HTMLElement {
         const chip = document.createElement('span');
         chip.className = 'bp-chip';
         chip.setAttribute('role', 'listitem');
+        chip.style.setProperty('--chip-h', String(tagHue(tag)));
         const label = document.createElement('span');
         label.className = 'bp-chip__label';
         label.textContent = tag;
@@ -409,21 +410,6 @@ export class BoardPreviewCell extends HTMLElement {
     const sel = this._tagsAddSel;
     const value = sel.value;
     if (!value) return;
-    if (value === '__custom__') {
-      const raw = window.prompt('输入自定义标签（多个用逗号分隔）');
-      sel.value = '';
-      if (!raw) return;
-      const parts = raw
-        .split(/[，,]/)
-        .map((s) => s.trim())
-        .filter(Boolean);
-      let changed = false;
-      for (const t of parts) {
-        if (this._addTag(t, false)) changed = true;
-      }
-      if (changed) this._afterTagsChanged();
-      return;
-    }
     if (value.startsWith('tag:')) {
       const tag = value.slice(4);
       sel.value = '';
@@ -469,14 +455,35 @@ export class BoardPreviewCell extends HTMLElement {
     this._opSeqEl.textContent = operationsToGlyphString(this._operations);
   }
 
+  /**
+   * 向上派发 toast 事件（由 BoardPreviewApp 监听并展示）。
+   * @param {string} message
+   * @param {'info' | 'success' | 'warn' | 'error'} [kind]
+   */
+  _emitToast(message, kind = 'info') {
+    this.dispatchEvent(
+      new CustomEvent('bp:toast', {
+        detail: { message, kind },
+        bubbles: true,
+        composed: true,
+      }),
+    );
+  }
+
   async _copyLevelStr() {
     this._setError('');
     const text = this._levelTextarea.value;
+    if (!text) {
+      this._emitToast('当前没有可复制的 level 串。', 'warn');
+      return;
+    }
     try {
       await navigator.clipboard.writeText(text);
+      this._emitToast('已复制 level 串到剪贴板', 'success');
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
       this._setError(`复制失败：${msg}（请检查浏览器权限）`);
+      this._emitToast('复制失败，请检查浏览器权限', 'error');
     }
   }
 
@@ -485,9 +492,11 @@ export class BoardPreviewCell extends HTMLElement {
     try {
       const text = await navigator.clipboard.readText();
       this._levelTextarea.value = text;
+      this._emitToast('已从剪贴板粘贴', 'success');
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
       this._setError(`粘贴失败：${msg}（请检查浏览器权限）`);
+      this._emitToast('粘贴失败，请检查浏览器权限', 'error');
     }
   }
 
@@ -495,6 +504,7 @@ export class BoardPreviewCell extends HTMLElement {
     this._setError('');
     if (!this._sourceLevelStr) {
       this._setError('请先点击「解码 / 应用」以记录原始关卡，再使用本功能。');
+      this._emitToast('尚无原始关卡，请先解码', 'warn');
       return;
     }
     this._levelTextarea.value = this._sourceLevelStr;
@@ -502,6 +512,137 @@ export class BoardPreviewCell extends HTMLElement {
     this._hadZ = false;
     this._updateOpLog();
     this.applyDecode(false);
+    this._emitToast('已重置为原始关卡', 'success');
+  }
+
+  /**
+   * 把当前棋盘（含 Z 偏移）绘到一个独立 canvas 并触发下载。
+   * 失败时通过 toast 与 _setError 双通道提示。
+   */
+  async _downloadBoardPng() {
+    this._setError('');
+    if (!this._tiles.length) {
+      this._emitToast('请先解码出有效棋盘后再下载。', 'warn');
+      return;
+    }
+    try {
+      const blob = await this._renderBoardToPng();
+      if (!blob) throw new Error('canvas 转换为图片失败');
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = this._buildPngFileName();
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      setTimeout(() => URL.revokeObjectURL(url), 1000);
+      this._emitToast('已开始下载棋盘 PNG', 'success');
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      this._setError(`下载 PNG 失败：${msg}`);
+      this._emitToast(`下载 PNG 失败：${msg}`, 'error');
+    }
+  }
+
+  _buildPngFileName() {
+    const seq = this._sequence?.index;
+    const tail = Number.isFinite(seq) ? `-${seq}` : '';
+    return `board-preview${tail}.png`;
+  }
+
+  /**
+   * 基于 _tiles + _zOffset 在离屏 canvas 上重绘棋盘并返回 PNG Blob。
+   * 不依赖 DOM，确保导出尺寸与 padding 与屏幕展示一致（按 colCells 计算占比）。
+   * @returns {Promise<Blob | null>}
+   */
+  async _renderBoardToPng() {
+    const TILE_PX = 96;
+    const PAD_PX = 18;
+    const GAP_PX = 2;
+    const { xmin, xmax, ymin, ymax, zmin, zmax } = getBounds(this._tiles);
+    const rowCells = Math.max(1, xmax - xmin + 2);
+    const colCells = Math.max(1, ymax - ymin + 2);
+    const layers = Math.max(0, (zmax ?? 0) - (zmin ?? 0));
+    const { enabled, x: zoX, y: zoY } = this._zOffset || {
+      enabled: false,
+      x: 0,
+      y: 0,
+    };
+    // padding 与屏幕版逻辑一致：层数 × |偏移%| × tile/格占比；离屏 canvas 直接用 px。
+    const padScale = enabled && layers > 0 ? (TILE_PX * layers) / 100 : 0;
+    const padTop = PAD_PX + Math.max(0, -zoY) * padScale;
+    const padBottom = PAD_PX + Math.max(0, zoY) * padScale;
+    const padLeft = PAD_PX + Math.max(0, -zoX) * padScale;
+    const padRight = PAD_PX + Math.max(0, zoX) * padScale;
+    const innerW = colCells * TILE_PX + (colCells - 1) * GAP_PX;
+    const innerH = rowCells * TILE_PX + (rowCells - 1) * GAP_PX;
+    const width = Math.ceil(padLeft + innerW + padRight);
+    const height = Math.ceil(padTop + innerH + padBottom);
+
+    const canvas = document.createElement('canvas');
+    canvas.width = width;
+    canvas.height = height;
+    const ctx = canvas.getContext('2d');
+    if (!ctx) throw new Error('当前浏览器不支持 canvas 2D');
+
+    const bgGrad = ctx.createLinearGradient(0, 0, width, height);
+    bgGrad.addColorStop(0, '#143d2e');
+    bgGrad.addColorStop(1, '#0d2818');
+    ctx.fillStyle = bgGrad;
+    ctx.fillRect(0, 0, width, height);
+
+    const order = sortTiles(this._tiles);
+    const baseCache = new Map();
+    /** @param {string} src */
+    const loadImg = (src) => {
+      if (!src) return Promise.resolve(null);
+      if (baseCache.has(src)) return baseCache.get(src);
+      const p = new Promise((resolve) => {
+        const img = new Image();
+        img.onload = () => resolve(img);
+        img.onerror = () => resolve(null);
+        img.src = src;
+      });
+      baseCache.set(src, p);
+      return p;
+    };
+
+    for (const t of order) {
+      const baseLeft =
+        padLeft + (t.y - ymin) * (TILE_PX / 2 + GAP_PX / 2);
+      // tile 实际宽度等于 2 grid cell + 1 gap：
+      const tileWidth = TILE_PX * 2 + GAP_PX;
+      const tileHeight = TILE_PX * 2 + GAP_PX;
+      const xCell = (t.y - ymin) * (TILE_PX + GAP_PX);
+      const yCell = (t.x - xmin) * (TILE_PX + GAP_PX);
+      let drawX = padLeft + xCell;
+      let drawY = padTop + yCell;
+      if (enabled && layers > 0) {
+        const zLevel = t.z - (zmin ?? 0);
+        drawX += (zLevel * zoX * tileWidth) / 100;
+        drawY += (zLevel * zoY * tileHeight) / 100;
+      }
+      void baseLeft;
+      const { base } = tileAssetPaths(t.suit);
+      const img = await loadImg(base);
+      if (img) {
+        ctx.drawImage(img, drawX, drawY, tileWidth, tileHeight);
+      } else {
+        ctx.fillStyle = '#153528';
+        ctx.fillRect(drawX, drawY, tileWidth, tileHeight);
+      }
+      const label = t.suit || '·';
+      ctx.font =
+        '600 28px ui-sans-serif, system-ui, -apple-system, "PingFang SC", sans-serif';
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'middle';
+      ctx.fillStyle = 'rgba(0, 0, 0, 0.85)';
+      ctx.fillText(label, drawX + tileWidth / 2, drawY + tileHeight / 2);
+    }
+
+    return await new Promise((resolve) =>
+      canvas.toBlob(resolve, 'image/png'),
+    );
   }
 
   /**

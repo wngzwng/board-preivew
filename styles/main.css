@@ -473,6 +473,12 @@ board-preview-app {
   border-color: var(--bp-muted);
 }
 
+/* 在元素上显式设置 `display:` 会盖掉 `[hidden]` 的 UA 样式（user-agent stylesheet）；
+ * 这里加一条全局兜底，确保任何元素带 `[hidden]` 时都正确隐藏。 */
+[hidden] {
+  display: none !important;
+}
+
 .bp-btn--primary {
   background: #238636;
   border-color: #238636;
@@ -639,15 +645,24 @@ board-preview-cell {
   align-self: center;
 }
 
+/* chip 颜色由 --chip-h（HSL 色相）派生；调用方在 JS 里通过 tagHue(tag) 写入。
+ * 未设置时回落到默认色相 145°（与 UI 主色 ~145° 同区，与无色版本表现接近）。
+ *
+ * 视觉语言：
+ * - 默认（未激活）：暗背景 + 弱边框 + 中性文字，确保大量 chip 同时出现时不抢戏
+ * - 激活（带 .bp-app__tag-stat--active）：实色饱和背景 + 白字 + 外光晕，
+ *   保证在一片未激活 chip 中一眼可辨
+ */
 .bp-chip {
+  --chip-h: 145;
   display: inline-flex;
   align-items: center;
   gap: 0.25rem;
   padding: 0.15rem 0.3rem 0.15rem 0.5rem;
   font-size: 0.78rem;
-  color: var(--bp-text);
-  background: var(--bp-panel);
-  border: 1px solid var(--bp-border);
+  color: hsl(var(--chip-h) 55% 82%);
+  background: hsl(var(--chip-h) 45% 18% / 0.38);
+  border: 1px solid hsl(var(--chip-h) 50% 45% / 0.38);
   border-radius: 999px;
   line-height: 1.4;
 }
@@ -666,7 +681,7 @@ board-preview-cell {
   padding: 0;
   font-size: 0.95rem;
   line-height: 1;
-  color: var(--bp-muted);
+  color: hsl(var(--chip-h) 35% 78%);
   background: transparent;
   border: 0;
   border-radius: 999px;
@@ -675,7 +690,7 @@ board-preview-cell {
 
 .bp-chip__remove:hover {
   color: #fff;
-  background: rgba(255, 255, 255, 0.1);
+  background: hsl(var(--chip-h) 60% 55% / 0.35);
 }
 
 .bp-app__tags {
@@ -717,6 +732,292 @@ board-preview-cell {
 .bp-app__tags-hint {
   font-size: 0.78rem;
   color: var(--bp-muted);
+}
+
+/* ===== B4 / C2：使用统计 chip 行 + 筛选控制 ===== */
+
+.bp-app__tag-stats-wrap {
+  flex: 1 1 100%;
+  display: flex;
+  flex-direction: column;
+  gap: 0.4rem;
+  padding-top: 0.5rem;
+  border-top: 1px dashed var(--bp-border);
+}
+
+.bp-app__tag-stats-ctrl {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.4rem 0.6rem;
+  font-size: 0.78rem;
+  color: var(--bp-muted);
+}
+
+.bp-app__tag-stats-ctrl-label {
+  color: var(--bp-muted);
+}
+
+.bp-app__filter-mode {
+  min-width: 3rem;
+}
+
+.bp-app__filter-empty {
+  flex: 1 1 auto;
+}
+
+.bp-app__tag-stats {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.35rem 0.45rem;
+  min-height: 1.6rem;
+}
+
+.bp-app__tag-stats-empty {
+  font-size: 0.78rem;
+  color: var(--bp-muted);
+  align-self: center;
+}
+
+/* 把按钮 chip 化：复用 .bp-chip 的 hsl 配色，自己额外加可点击的视觉反馈 */
+.bp-app__tag-stat {
+  appearance: none;
+  font: inherit;
+  cursor: pointer;
+  transition: transform 0.08s ease, background 0.12s ease, border-color 0.12s ease;
+}
+
+.bp-app__tag-stat:hover {
+  transform: translateY(-1px);
+  background: hsl(var(--chip-h) 55% 28% / 0.55);
+  border-color: hsl(var(--chip-h) 60% 55% / 0.7);
+}
+
+.bp-app__tag-stat:focus-visible {
+  outline: 2px solid hsl(var(--chip-h) 75% 70%);
+  outline-offset: 2px;
+}
+
+.bp-app__tag-stat--active {
+  background: hsl(var(--chip-h) 85% 50%);
+  border-color: hsl(var(--chip-h) 95% 75%);
+  color: #fff;
+  font-weight: 600;
+  box-shadow:
+    0 0 0 2px hsl(var(--chip-h) 95% 70% / 0.45),
+    0 2px 8px hsl(var(--chip-h) 80% 45% / 0.55);
+}
+
+.bp-app__tag-stat--active:hover {
+  background: hsl(var(--chip-h) 90% 55%);
+  border-color: hsl(var(--chip-h) 100% 80%);
+}
+
+.bp-app__tag-stat--empty {
+  opacity: 0.45;
+  background: rgba(255, 255, 255, 0.02);
+  border-color: var(--bp-border);
+  color: var(--bp-muted);
+}
+
+.bp-app__tag-stat--empty .bp-app__tag-stat-count {
+  color: var(--bp-muted);
+}
+
+.bp-app__tag-stat-count {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 1.1rem;
+  padding: 0 0.25rem;
+  margin-left: 0.15rem;
+  font-size: 0.7rem;
+  font-weight: 500;
+  line-height: 1.2;
+  color: hsl(var(--chip-h) 65% 82%);
+  background: hsl(var(--chip-h) 40% 12% / 0.6);
+  border-radius: 999px;
+}
+
+.bp-app__tag-stat--active .bp-app__tag-stat-count {
+  color: #fff;
+  background: hsl(0 0% 100% / 0.22);
+}
+
+/* 「暂无标签」虚拟筛选 chip：脱离色相哈希体系，保持中性灰，与具体标签视觉区分 */
+.bp-app__tag-stat--untagged {
+  background: rgba(255, 255, 255, 0.04);
+  border-color: var(--bp-border);
+  border-style: dashed;
+  color: var(--bp-muted);
+}
+
+.bp-app__tag-stat--untagged:hover {
+  background: rgba(255, 255, 255, 0.08);
+  border-color: var(--bp-border-strong, rgba(255, 255, 255, 0.25));
+  color: var(--bp-text, #e8eaed);
+}
+
+.bp-app__tag-stat--untagged .bp-app__tag-stat-count {
+  color: var(--bp-muted);
+  background: rgba(255, 255, 255, 0.08);
+}
+
+.bp-app__tag-stat--untagged.bp-app__tag-stat--active {
+  background: #6b7280;
+  border-color: #9ca3af;
+  border-style: solid;
+  color: #fff;
+  box-shadow:
+    0 0 0 2px rgba(156, 163, 175, 0.45),
+    0 2px 8px rgba(75, 85, 99, 0.55);
+}
+
+.bp-app__tag-stat--untagged.bp-app__tag-stat--active:hover {
+  background: #7c8693;
+  border-color: #b9c0ca;
+}
+
+.bp-app__tag-stat--untagged.bp-app__tag-stat--active .bp-app__tag-stat-count {
+  color: #fff;
+  background: hsl(0 0% 100% / 0.22);
+}
+
+.bp-app--filter-on .bp-app__filter-empty {
+  display: none;
+}
+
+/* ===== 多标签导出浮层 ===== */
+
+.bp-export-modal {
+  position: fixed;
+  inset: 0;
+  z-index: 90;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 1.5rem;
+}
+
+.bp-export-modal__backdrop {
+  position: absolute;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.55);
+  backdrop-filter: blur(2px);
+}
+
+.bp-export-modal__card {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  width: min(560px, 100%);
+  max-height: min(80vh, 640px);
+  background: var(--bp-panel);
+  border: 1px solid var(--bp-border);
+  border-radius: 12px;
+  box-shadow: 0 24px 56px rgba(0, 0, 0, 0.55);
+  overflow: hidden;
+}
+
+.bp-export-modal__hdr {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0.75rem 1rem;
+  border-bottom: 1px solid var(--bp-border);
+}
+
+.bp-export-modal__title {
+  margin: 0;
+  font-size: 0.95rem;
+  font-weight: 600;
+  color: var(--bp-text);
+}
+
+.bp-export-modal__close {
+  appearance: none;
+  width: 1.6rem;
+  height: 1.6rem;
+  padding: 0;
+  font-size: 1.1rem;
+  line-height: 1;
+  color: var(--bp-muted);
+  background: transparent;
+  border: 0;
+  border-radius: 6px;
+  cursor: pointer;
+}
+
+.bp-export-modal__close:hover {
+  color: #fff;
+  background: rgba(255, 255, 255, 0.08);
+}
+
+.bp-export-modal__body {
+  display: flex;
+  flex-direction: column;
+  gap: 0.6rem;
+  padding: 0.9rem 1rem;
+  overflow: auto;
+}
+
+.bp-export-modal__ctrl {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 0.4rem 0.6rem;
+  font-size: 0.82rem;
+  color: var(--bp-muted);
+}
+
+.bp-export-modal__hint {
+  flex: 0 1 auto;
+  color: var(--bp-muted);
+}
+
+.bp-export-modal__spacer {
+  flex: 1 1 auto;
+}
+
+.bp-export-modal__chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.4rem 0.45rem;
+  max-height: 280px;
+  padding: 0.5rem 0.6rem;
+  background: var(--bp-bg);
+  border: 1px solid var(--bp-border);
+  border-radius: 8px;
+  overflow: auto;
+}
+
+.bp-export-modal__summary {
+  font-size: 0.82rem;
+  color: var(--bp-muted);
+}
+
+.bp-export-modal__ftr {
+  display: flex;
+  justify-content: flex-end;
+  gap: 0.5rem;
+  padding: 0.65rem 1rem;
+  border-top: 1px solid var(--bp-border);
+  background: rgba(0, 0, 0, 0.18);
+}
+
+.bp-btn--primary {
+  background: hsl(145 55% 32%);
+  border-color: hsl(145 60% 45%);
+  color: #fff;
+}
+
+.bp-btn--primary:hover:not(:disabled) {
+  background: hsl(145 60% 38%);
+}
+
+.bp-btn--primary:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
 }
 
 .bp-cell__tools {
@@ -862,4 +1163,144 @@ code {
   padding: 0.1em 0.35em;
   background: var(--bp-bg);
   border-radius: 4px;
+}
+
+/* ===== 全局折叠：棋盘优先紧凑视图 =====
+ * 由 BoardPreviewApp 上的 .bp-app--cells-collapsed class 触发；
+ * 折叠时每个 Cell 只保留：序号、棋盘、x/y/z 范围、复制按钮、标签添加入口。
+ */
+
+.bp-app__collapse-toggle {
+  flex: 0 0 auto;
+}
+
+.bp-app__collapse-toggle--header {
+  margin-left: auto;
+}
+
+.bp-app--cells-collapsed .bp-cell__label,
+.bp-app--cells-collapsed .bp-cell__decode,
+.bp-app--cells-collapsed .bp-cell__hdr-sub [data-action="paste-level"],
+.bp-app--cells-collapsed .bp-cell__hdr-sub [data-action="reset-level"],
+.bp-app--cells-collapsed .bp-cell__hdr-sub [data-action="download-png"],
+.bp-app--cells-collapsed .bp-cell__tools,
+.bp-app--cells-collapsed .bp-cell__op-log,
+.bp-app--cells-collapsed .bp-cell__label-text,
+.bp-app--cells-collapsed .bp-cell__tags-empty {
+  display: none !important;
+}
+
+/* 折叠态：把 .bp-cell__hdr / .bp-cell__hdr-side / .bp-cell__tags /
+ * .bp-cell__tags-head 这四层容器全部 display:contents 扁平化，
+ * 让「复制」按钮组、「+ 添加」下拉、已选标签 chip 直接成为 Cell 的并排子项，
+ * 自然合并到同一行。 */
+.bp-app--cells-collapsed .bp-cell__hdr,
+.bp-app--cells-collapsed .bp-cell__hdr-side,
+.bp-app--cells-collapsed .bp-cell__tags,
+.bp-app--cells-collapsed .bp-cell__tags-head {
+  display: contents;
+}
+
+.bp-app--cells-collapsed .bp-cell__hdr-sub,
+.bp-app--cells-collapsed .bp-cell__tags-chips {
+  display: inline-flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.3rem;
+  margin: 0 0 0.35rem;
+  padding: 0;
+  background: transparent;
+  border: 0;
+  min-height: 0;
+  vertical-align: middle;
+}
+
+.bp-app--cells-collapsed .bp-cell__tags-add {
+  margin: 0 0.3rem 0.35rem 0;
+  vertical-align: middle;
+}
+
+/* ===== Toast 堆栈 ===== */
+
+.bp-app__toast-stack {
+  position: fixed;
+  right: 1rem;
+  bottom: 1rem;
+  z-index: 9999;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 0.45rem;
+  pointer-events: none;
+}
+
+.bp-toast {
+  min-width: 12rem;
+  max-width: min(80vw, 28rem);
+  padding: 0.55rem 0.85rem;
+  font-size: 0.85rem;
+  line-height: 1.4;
+  color: var(--bp-text);
+  background: rgba(26, 35, 50, 0.96);
+  border: 1px solid var(--bp-border);
+  border-left: 3px solid var(--bp-accent);
+  border-radius: 8px;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.35);
+  opacity: 0;
+  transform: translateY(8px);
+  transition: opacity 0.18s ease, transform 0.18s ease;
+  pointer-events: auto;
+}
+
+.bp-toast--show {
+  opacity: 1;
+  transform: translateY(0);
+}
+
+.bp-toast--success { border-left-color: var(--bp-accent); }
+.bp-toast--warn    { border-left-color: #d29922; }
+.bp-toast--error   { border-left-color: var(--bp-danger); }
+.bp-toast--info    { border-left-color: #58a6ff; }
+
+/* ===== 全屏拖拽导入覆盖层 =====
+ * 监听 `<bp-app>` 自身的 drag 事件；进入时切换 `.bp-app--dragover` 类来显示一个
+ * 居中提示卡片。`pointer-events: none` 避免覆盖层吞掉 dragleave/drop 事件。 */
+.bp-app--dragover::before {
+  content: '';
+  position: fixed;
+  inset: 0;
+  z-index: 200;
+  background: rgba(0, 0, 0, 0.55);
+  backdrop-filter: blur(2px);
+  pointer-events: none;
+  animation: bp-fade-in 0.12s ease-out;
+}
+
+.bp-app--dragover::after {
+  content: '释放以导入 CSV';
+  position: fixed;
+  top: 50%;
+  left: 50%;
+  z-index: 201;
+  padding: 1.25rem 2rem;
+  font-size: 1.2rem;
+  font-weight: 600;
+  color: var(--bp-accent);
+  background: var(--bp-panel);
+  border: 2px dashed var(--bp-accent);
+  border-radius: 14px;
+  box-shadow: 0 12px 32px rgba(0, 0, 0, 0.55);
+  transform: translate(-50%, -50%);
+  pointer-events: none;
+  animation: bp-pop-in 0.14s ease-out;
+}
+
+@keyframes bp-fade-in {
+  from { opacity: 0; }
+  to   { opacity: 1; }
+}
+
+@keyframes bp-pop-in {
+  from { opacity: 0; transform: translate(-50%, -50%) scale(0.94); }
+  to   { opacity: 1; transform: translate(-50%, -50%) scale(1); }
 }

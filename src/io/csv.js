@@ -8,6 +8,69 @@ import { readTextFileUtf8 } from './bundle.js';
 /** 默认关卡串所在列表头名（不区分大小写） */
 export const DEFAULT_CONTENT_COLUMN = 'Content';
 
+/** 默认 Tags 所在列表头名（不区分大小写） */
+export const DEFAULT_TAGS_COLUMN = 'Tags';
+
+/**
+ * Tags 单元格在 CSV 中使用的写出分隔符。
+ * - 选用 `|` 而非 `,`：避免被 CSV 引擎再包一层双引号，肉眼可读
+ * - 解析时同时容忍 `,` / `;` / `|` / 空白，便于人工编辑后再导入
+ */
+export const TAGS_CSV_SEPARATOR = '|';
+
+/**
+ * 解析单个「Tags 列」单元格为 tag 数组：
+ * - 空字符串返回 `[]`
+ * - 切分符号集：`|`、`,`、`，`、`;`、`；`、连续空白
+ * - 自动 `trim` 与去重，保持原始出现顺序
+ *
+ * @param {string} cell
+ * @returns {string[]}
+ */
+export function parseTagsCellValue(cell) {
+  const raw = String(cell ?? '').trim();
+  if (!raw) return [];
+  const parts = raw.split(/[|,，;；\s]+/);
+  const seen = new Set();
+  const out = [];
+  for (const p of parts) {
+    const t = p.trim();
+    if (!t || seen.has(t)) continue;
+    seen.add(t);
+    out.push(t);
+  }
+  return out;
+}
+
+/**
+ * 把 tag 数组拼接成可写入 CSV 的单元格字符串（写出统一用 {@link TAGS_CSV_SEPARATOR}）。
+ *
+ * @param {readonly string[]} tags
+ * @returns {string}
+ */
+export function joinTagsForCsv(tags) {
+  if (!Array.isArray(tags) || !tags.length) return '';
+  return tags
+    .map((t) => String(t ?? '').trim())
+    .filter(Boolean)
+    .join(TAGS_CSV_SEPARATOR);
+}
+
+/**
+ * 匹配 {@link DEFAULT_TAGS_COLUMN} 的列索引；无匹配则 -1（视为「无」）。
+ * 与 {@link defaultContentColumnIndex} 不同：未命中时不退回 0，
+ * 因为「没有 Tags 列」是合法默认状态。
+ *
+ * @param {string[]} headerLikeLabels
+ * @returns {number}
+ */
+export function defaultTagsColumnIndex(headerLikeLabels) {
+  const want = DEFAULT_TAGS_COLUMN.toLowerCase();
+  return headerLikeLabels.findIndex(
+    (l) => String(l ?? '').trim().toLowerCase() === want,
+  );
+}
+
 /**
  * @param {string[][]} rows
  * @returns {number}
@@ -227,6 +290,9 @@ export const APPENDED_EXPORT_COLUMNS = Object.freeze([
 /** 可选「Index」列在最前面的表头名 */
 export const INDEX_COLUMN_NAME = 'Index';
 
+/** 追加 Tags 列时使用的表头名 */
+export const TAGS_COLUMN_NAME = 'Tags';
+
 /**
  * @typedef {{
  *   originalRow: string[] | null,
@@ -238,6 +304,8 @@ export const INDEX_COLUMN_NAME = 'Index';
  *   originalColumnCount?: number,         // 原始 CSV 列数（用于无表头时对齐）
  *   entries: ExportEntry[],
  *   operatorOf: (ops: Array<{ type: string }>) => string,
+ *   tagsOf?: (item: import('./bundle.js').BundleItem) => readonly string[],
+ *   tagsColumnIndex?: number | null,     // 导入时识别到的 Tags 列索引；null=没有，导出会追加新列
  *   withBom?: boolean,
  *   withIndex?: boolean,                  // 在最前追加 1 起的自增 Index 列
  *   indexStart?: number,                  // 自增起始值（默认 1）
@@ -245,10 +313,14 @@ export const INDEX_COLUMN_NAME = 'Index';
  */
 
 /**
- * 导出 CSV：保留原始 CSV 的列，追加 4 个新列：
- * `sourceLevel, operator, targetLevel, HasZOperator`。
+ * 导出 CSV：保留原始 CSV 的列，追加 `Tags` 与四个生成列：
+ * `Tags, sourceLevel, operator, targetLevel, HasZOperator`。
  *
- * - 没有原始 CSV 时（如手动新增的预览框），仅输出 4 列。
+ * Tags 列写出规则：
+ * - `tagsColumnIndex` 为合法非负数：把该列覆盖为 cell 当前 tags（避免回环导入时列重复）
+ * - 否则（默认）：在 4 个 appended 列前**追加**一列名为 `Tags`
+ *
+ * - 没有原始 CSV 时（如手动新增的预览框），仅输出 `Tags` + 4 列。
  * - 没有表头但有列数时，原始列以「列 0、列 1…」展示在表头。
  *
  * @param {ExportCsvOptions} options
@@ -260,6 +332,8 @@ export function serializeExportCsv(options) {
     originalColumnCount,
     entries,
     operatorOf,
+    tagsOf = (item) => item?.tags ?? [],
+    tagsColumnIndex = null,
     withBom = true,
     withIndex = false,
     indexStart = 1,
@@ -278,9 +352,18 @@ export function serializeExportCsv(options) {
       ? header.slice()
       : Array.from({ length: baseColCount }, (_, i) => `列 ${i}`);
 
+  const overwriteIdx =
+    Number.isInteger(tagsColumnIndex) &&
+    /** @type {number} */ (tagsColumnIndex) >= 0 &&
+    /** @type {number} */ (tagsColumnIndex) < baseColCount
+      ? /** @type {number} */ (tagsColumnIndex)
+      : null;
+  const appendTagsCol = overwriteIdx === null;
+
   const fullHeader = [
     ...(withIndex ? [INDEX_COLUMN_NAME] : []),
     ...baseHeader,
+    ...(appendTagsCol ? [TAGS_COLUMN_NAME] : []),
     ...APPENDED_EXPORT_COLUMNS,
   ];
   const lines = [fullHeader.map(escapeCsvField).join(',')];
@@ -291,6 +374,10 @@ export function serializeExportCsv(options) {
       { length: baseColCount },
       (_, j) => (originalRow && originalRow[j] != null ? originalRow[j] : ''),
     );
+    const tagsStr = joinTagsForCsv(tagsOf(item));
+    if (overwriteIdx !== null) {
+      baseCells[overwriteIdx] = tagsStr;
+    }
     const operator = operatorOf(item.operations ?? []);
     const appended = [
       item.sourceLevelStr ?? '',
@@ -298,9 +385,10 @@ export function serializeExportCsv(options) {
       item.levelStr ?? '',
       item.meta?.hadZAxisOperation ? '1' : '0',
     ];
+    const middle = appendTagsCol ? [tagsStr] : [];
     const cells = withIndex
-      ? [String(indexStart + i), ...baseCells, ...appended]
-      : [...baseCells, ...appended];
+      ? [String(indexStart + i), ...baseCells, ...middle, ...appended]
+      : [...baseCells, ...middle, ...appended];
     lines.push(cells.map(escapeCsvField).join(','));
     i++;
   }

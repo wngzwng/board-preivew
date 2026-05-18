@@ -5,10 +5,19 @@ import {
   serializeExportCsv,
   getColumnLabelsFromRows,
   defaultContentColumnIndex,
+  defaultTagsColumnIndex,
+  parseTagsCellValue,
   getMaxColumnCount,
   DEFAULT_CONTENT_COLUMN,
+  DEFAULT_TAGS_COLUMN,
 } from '../io/csv.js';
 import { operationsToGlyphString } from '../board/operationGlyphs.js';
+import {
+  countTagUsage,
+  matchTagFilter,
+  readEntryTags,
+} from '../io/tagFilter.js';
+import { tagHue } from '../utils/tagColor.js';
 
 export class BoardPreviewApp extends HTMLElement {
   constructor() {
@@ -20,9 +29,62 @@ export class BoardPreviewApp extends HTMLElement {
     this._csvHeader = null;
     /** 已导入 CSV 的列数（无表头时用于补齐输出） */
     this._csvColumnCount = 0;
+    /**
+     * 导入时识别到的「Tags 所在列」索引；为 null 表示导入时没有 Tags 列，
+     * 导出时会**追加**一列 `Tags` 而不是覆盖。
+     * @type {number | null}
+     */
+    this._csvTagsColumnIndex = null;
+    /**
+     * 当前 `_pendingCsv` 是否已成功被导入过：
+     * 用于把「修改两个列下拉」标记为"会触发重新导入"的高风险操作。
+     * - 文件被选中但未点过确认导入 → false
+     * - 至少一次确认导入成功 → true，后续修改下拉会弹 toast 警告
+     */
+    this._csvImported = false;
     /** 用户在页头预设的标签（去重保序，逗号 / 中文逗号 / 空格分隔均可） */
     /** @type {string[]} */
     this._predefinedTags = [];
+    /**
+     * 上一次成功生效的预设标签快照，用于「删除拦截」的差集判断：
+     * 当 `previous \ next` 中存在 Cell 仍在使用的标签时，该次删除被拒绝。
+     * 与 `_predefinedTags` 严格保持同步。
+     * @type {string[]}
+     */
+    this._predefinedTagsCommitted = [];
+    /**
+     * 当前激活的标签筛选（C2）：纯内存状态，刷新即清空。
+     * - `tags`：已激活的标签集合
+     * - `mode`：多标签命中规则（OR / AND）
+     * - `includeUntagged`：是否把"完全没有标签的 Cell"也纳入筛选；
+     *   与 `tags` 在 OR 模式下并集，在 AND 模式下交集（通常为空集）
+     * - 仅当 `tags.size === 0 && !includeUntagged` 时视为无筛选
+     *
+     * @type {{ tags: Set<string>, mode: 'or' | 'and', includeUntagged: boolean }}
+     */
+    this._tagFilter = { tags: new Set(), mode: 'or', includeUntagged: false };
+    /**
+     * 待执行的 summary 刷新 rAF 句柄；用于把同一帧内多次 bp-cell-change 合并成一次渲染。
+     * @type {number | null}
+     */
+    this._summaryRafId = null;
+    /**
+     * 多标签导出浮层的当前会话状态；为 null 表示浮层未打开。
+     * 关闭即丢弃，不写 localStorage（与 multi-tag-export.md §8 决策一致）。
+     * @type {{ tags: Set<string>, mode: 'or' | 'and', root: HTMLElement } | null}
+     */
+    this._exportTagModal = null;
+    /**
+     * dragenter / dragleave 计数器：进入子元素也会触发 enter/leave，必须用计数器
+     * 才能正确判断「拖拽是否真正离开了 `<bp-app>`」。
+     */
+    this._dragCounter = 0;
+    /**
+     * @param {KeyboardEvent} e
+     */
+    this._onExportTagModalKey = (e) => {
+      if (e.key === 'Escape') this._closeExportTagModal();
+    };
     /**
      * 全部预览框条目（懒渲染源）。`cellEl` 为 null 时仍是骨架，进入视口后才水合。
      * @type {Array<{
@@ -47,6 +109,36 @@ export class BoardPreviewApp extends HTMLElement {
      * @type {{ enabled: boolean, x: number, y: number }}
      */
     this._zOffset = this._loadZOffset();
+    /**
+     * 全局「Cell 折叠」开关：true 时所有 Cell 仅显示
+     * 序号 / 棋盘 / x,y,z 范围 / 复制按钮 / 标签添加入口，
+     * 隐藏其余编辑控件以让棋盘成为视觉主体。
+     * @type {boolean}
+     */
+    this._cellsCollapsed = this._loadCellsCollapsed();
+  }
+
+  /** @returns {boolean} */
+  _loadCellsCollapsed() {
+    try {
+      const raw = window.localStorage?.getItem(
+        BoardPreviewApp.CELLS_COLLAPSED_KEY,
+      );
+      return raw === '1';
+    } catch {
+      return false;
+    }
+  }
+
+  _saveCellsCollapsed() {
+    try {
+      window.localStorage?.setItem(
+        BoardPreviewApp.CELLS_COLLAPSED_KEY,
+        this._cellsCollapsed ? '1' : '0',
+      );
+    } catch {
+      // 隐私模式 / 配额超限时静默
+    }
   }
 
   /** @returns {{ enabled: boolean, x: number, y: number }} */
@@ -143,6 +235,28 @@ export class BoardPreviewApp extends HTMLElement {
   }
 
   /**
+   * 渲染「全部折叠 / 展开」全局按钮。所有入口共用同一 data-action，
+   * UI 通过 _syncCellsCollapseUi 双向同步文案。
+   * @param {'header' | 'sticky'} variant
+   */
+  _collapseToggleHtml(variant) {
+    const collapsed = this._cellsCollapsed;
+    const label = collapsed ? '展开全部' : '折叠全部';
+    const hint = collapsed
+      ? '当前为「棋盘优先」紧凑视图，点击展开所有编辑控件'
+      : '隐藏每个 Cell 的编辑控件，让棋盘成为主体';
+    return `
+      <button
+        type="button"
+        class="bp-btn bp-btn--sm bp-app__collapse-toggle bp-app__collapse-toggle--${variant}"
+        data-action="toggle-cells-collapse"
+        aria-pressed="${collapsed ? 'true' : 'false'}"
+        title="${hint}"
+      >${label}</button>
+    `;
+  }
+
+  /**
    * 渲染 Z 轴偏移紧凑开关（sticky 版本）：只一个复选框，与页头开关双向同步。
    * @param {'sticky'} variant
    */
@@ -194,7 +308,7 @@ export class BoardPreviewApp extends HTMLElement {
           <button type="button" class="bp-btn bp-btn--primary" data-action="add-cell">＋ 预览框</button>
         </div>
         <div class="bp-app__csv" aria-label="CSV 导入导出">
-          <span class="bp-app__csv-hint">CSV：选择文件后<strong>自动读取表头</strong>，在下方选择关卡串所在列；默认选中 <code>${DEFAULT_CONTENT_COLUMN}</code> 列（不区分大小写）。</span>
+          <span class="bp-app__csv-hint">CSV：<strong>点击按钮选择</strong>或<strong>拖拽 .csv 文件到页面</strong>导入，在下方选择关卡串所在列（默认 <code>${DEFAULT_CONTENT_COLUMN}</code>）与标签所在列（默认 <code>${DEFAULT_TAGS_COLUMN}</code>，无此列则为「无」），均不区分大小写。</span>
           <div class="bp-csv-row">
             <label class="bp-csv-field bp-csv-field--check">
               <input type="checkbox" class="bp-csv-header" checked />
@@ -209,12 +323,26 @@ export class BoardPreviewApp extends HTMLElement {
             <label class="bp-csv-field bp-csv-field--grow">关卡串所在列
               <select class="bp-csv-column-select" aria-label="选择内容列"></select>
             </label>
+            <label class="bp-csv-field bp-csv-field--grow">标签所在列
+              <select class="bp-csv-tags-select" aria-label="选择标签列（可选）"></select>
+            </label>
             <button type="button" class="bp-btn bp-btn--primary" data-action="confirm-csv-import">确认导入</button>
             <button type="button" class="bp-btn" data-action="cancel-csv-import">取消</button>
           </div>
           <div class="bp-csv-row">
             <button type="button" class="bp-btn" data-action="export-csv">导出 CSV</button>
-            <button type="button" class="bp-btn" data-action="export-csv-tag">按标签导出 CSV…</button>
+            <button
+              type="button"
+              class="bp-btn"
+              data-action="export-csv-tag-multi"
+              title="弹出多选浮层（支持 AND / OR）"
+            >按标签导出 CSV…</button>
+            <button
+              type="button"
+              class="bp-btn"
+              data-action="export-csv-tag"
+              title="单关键字子串匹配（弹出输入框）"
+            >按关键词导出 CSV</button>
             <label class="bp-csv-field bp-csv-field--check">
               <input type="checkbox" class="bp-csv-export-index" data-role="index-toggle" />
               添加 Index 列（1 起自增）
@@ -228,6 +356,7 @@ export class BoardPreviewApp extends HTMLElement {
         <div class="bp-app__zoffset-bar" aria-label="Z 轴偏移">
           ${this._zOffsetGroupHtml('header')}
           <span class="bp-app__zoffset-hint">每升一层 z 按棋子宽度的百分比偏移（仅渲染效果，不影响导出）。</span>
+          ${this._collapseToggleHtml('header')}
         </div>
         <div class="bp-app__tags" aria-label="预设标签">
           <label class="bp-app__tags-field">
@@ -242,8 +371,28 @@ export class BoardPreviewApp extends HTMLElement {
             />
           </label>
           <span class="bp-app__tags-hint">
-            预览框内可直接从下拉框选择；如需临时新增可选「自定义…」。
+            预览框只能从下拉选择已有标签；移除某个标签前请先在 Cell 中清空它的使用。
           </span>
+          <div class="bp-app__tag-stats-wrap" aria-label="标签使用统计与筛选">
+            <div class="bp-app__tag-stats-ctrl">
+              <span class="bp-app__tag-stats-ctrl-label">筛选</span>
+              <button
+                type="button"
+                class="bp-btn bp-btn--sm bp-app__filter-mode"
+                data-action="toggle-filter-mode"
+                aria-pressed="false"
+                title="切换筛选模式：OR=任一命中即显示；AND=必须全部含才显示"
+              >OR</button>
+              <button
+                type="button"
+                class="bp-btn bp-btn--sm bp-app__filter-clear"
+                data-action="clear-tag-filter"
+                hidden
+              >清空筛选</button>
+              <span class="bp-app__filter-empty" data-role="filter-empty">点击下方标签即可只显示包含该标签的预览框</span>
+            </div>
+            <div class="bp-app__tag-stats" role="list" data-role="tag-stats"></div>
+          </div>
         </div>
         <div class="bp-app__sentinel" aria-hidden="true"></div>
       </header>
@@ -255,13 +404,25 @@ export class BoardPreviewApp extends HTMLElement {
             <input type="file" class="bp-app__csv-file-sticky" accept=".csv,text/csv" data-role="csv-file" hidden />
           </label>
           <button type="button" class="bp-btn" data-action="export-csv">导出 CSV</button>
-          <button type="button" class="bp-btn" data-action="export-csv-tag">按标签导出 CSV…</button>
+          <button
+            type="button"
+            class="bp-btn"
+            data-action="export-csv-tag-multi"
+            title="弹出多选浮层（支持 AND / OR）"
+          >按标签导出 CSV…</button>
+          <button
+            type="button"
+            class="bp-btn"
+            data-action="export-csv-tag"
+            title="单关键字子串匹配（弹出输入框）"
+          >按关键词导出 CSV</button>
           <label class="bp-csv-field bp-csv-field--check">
             <input type="checkbox" class="bp-csv-export-index" data-role="index-toggle" />
             Index 列
           </label>
           ${this._jumpGroupHtml('sticky')}
           ${this._zOffsetToggleHtml('sticky')}
+          ${this._collapseToggleHtml('sticky')}
         </div>
         <div class="bp-app__sticky-row bp-app__sticky-row--tags">
           <span class="bp-app__sticky-tags-label">预设标签</span>
@@ -277,6 +438,7 @@ export class BoardPreviewApp extends HTMLElement {
       </div>
       <div class="bp-app__grid-info" hidden></div>
       <div class="bp-app__grid"></div>
+      <div class="bp-app__toast-stack" role="status" aria-live="polite" aria-atomic="false"></div>
     `;
     this._grid = /** @type {HTMLDivElement} */ (
       this.querySelector('.bp-app__grid')
@@ -286,14 +448,97 @@ export class BoardPreviewApp extends HTMLElement {
     this.addEventListener('change', (e) => this._onDelegatedChange(e));
     this.addEventListener('input', (e) => this._onDelegatedInput(e));
     this.addEventListener('keydown', (e) => this._onDelegatedKeydown(e));
+    this.addEventListener('bp:toast', (e) => {
+      const detail = /** @type {CustomEvent} */ (e).detail || {};
+      this._toast(detail.message, {
+        kind: detail.kind,
+        ttl: detail.ttl,
+      });
+    });
+    this.addEventListener('bp-cell-change', () => {
+      this._scheduleSummaryRefresh();
+    });
+    this.addEventListener('dragenter', (e) => this._onAppDragEnter(e));
+    this.addEventListener('dragover', (e) => this._onAppDragOver(e));
+    this.addEventListener('dragleave', (e) => this._onAppDragLeave(e));
+    this.addEventListener('drop', (e) => this._onAppDrop(e));
+
+    this._onGlobalKeydown = this._onGlobalKeydown.bind(this);
+    document.addEventListener('keydown', this._onGlobalKeydown);
 
     this._initObserver();
     this._initStickyBar();
     this._applyZOffsetToRoot();
+    this._applyCellsCollapsedToRoot();
+    this._syncFilterControls();
 
     if (this._entries.length === 0) {
       this.addCell();
     }
+    // 必须在 addCell 之后渲染：第一个手动新增的 cell 也要进入「暂无标签 N」统计
+    this._renderPredefinedSummary();
+  }
+
+  disconnectedCallback() {
+    if (this._onGlobalKeydown) {
+      document.removeEventListener('keydown', this._onGlobalKeydown);
+    }
+  }
+
+  /**
+   * 全局键盘快捷键：
+   * - Space → 切换全部 Cell 折叠/展开
+   * - Z / z → 切换 Z 偏移
+   *
+   * 仅在以下条件下生效，避免和正在使用的表单/编辑控件冲突：
+   * 1. 没有被 meta/ctrl/alt 修饰；
+   * 2. 焦点不在输入控件（input / textarea / select / contenteditable）；
+   * 3. 焦点不在按钮（避免 Space 同时触发按钮原生 click 与全局快捷键的重复行为）；
+   * 4. 当前没有标签导出浮层占据焦点逻辑（浮层关闭时 _exportTagModal 为 null）。
+   *
+   * @param {KeyboardEvent} e
+   */
+  _onGlobalKeydown(e) {
+    if (e.repeat) return;
+    if (e.metaKey || e.ctrlKey || e.altKey) return;
+    if (this._exportTagModal) return;
+
+    const ae = document.activeElement;
+    if (ae) {
+      const tag = ae.tagName;
+      const editing =
+        tag === 'INPUT' ||
+        tag === 'TEXTAREA' ||
+        tag === 'SELECT' ||
+        tag === 'BUTTON' ||
+        /** @type {HTMLElement} */ (ae).isContentEditable;
+      if (editing) return;
+    }
+
+    const code = e.code;
+    const key = e.key;
+    if (code === 'Space' || key === ' ' || key === 'Spacebar') {
+      e.preventDefault();
+      this._toggleCellsCollapsed();
+      return;
+    }
+    if (key === 'z' || key === 'Z') {
+      e.preventDefault();
+      this._toggleZOffsetEnabled();
+    }
+  }
+
+  /**
+   * 不依赖 checkbox source 的 Z 偏移切换：用于全局快捷键与未来其他入口。
+   * 与 `_onZOffsetToggle(source)` 共用持久化 / 应用 / UI 同步逻辑。
+   */
+  _toggleZOffsetEnabled() {
+    const enabled = !this._zOffset.enabled;
+    this._zOffset = { ...this._zOffset, enabled };
+    this._saveZOffset();
+    this._applyZOffsetToRoot();
+    this._syncZOffsetToggleUi();
+    this._broadcastZOffset();
   }
 
   /** @param {Event} e */
@@ -318,14 +563,77 @@ export class BoardPreviewApp extends HTMLElement {
       case 'export-csv-tag':
         this.exportCsvByTag();
         break;
+      case 'export-csv-tag-multi':
+        this._openExportTagModal();
+        break;
+      case 'export-tag-modal-close':
+      case 'export-tag-modal-cancel':
+        this._closeExportTagModal();
+        break;
+      case 'export-tag-modal-toggle-mode':
+        this._toggleExportModalMode();
+        break;
+      case 'export-tag-modal-clear':
+        this._clearExportModalSelection();
+        break;
+      case 'export-tag-modal-toggle-tag':
+        this._toggleExportModalTag(btn.dataset.tag);
+        break;
+      case 'export-tag-modal-confirm':
+        this._confirmExportTagModal();
+        break;
       case 'jump-to':
         this._jumpFromInput(btn);
         break;
       case 'reset-zoffset':
         this._resetZOffset();
         break;
+      case 'toggle-cells-collapse':
+        this._toggleCellsCollapsed();
+        break;
+      case 'toggle-tag-filter':
+        this._toggleTagFilter(btn.dataset.tag);
+        break;
+      case 'toggle-untagged-filter':
+        this._toggleUntaggedFilter();
+        break;
+      case 'toggle-filter-mode':
+        this._toggleFilterMode();
+        break;
+      case 'clear-tag-filter':
+        this._clearTagFilter();
+        break;
       default:
     }
+  }
+
+  /** 全局切换 Cell 折叠态：写入 localStorage、刷新根 class 与按钮文案。 */
+  _toggleCellsCollapsed() {
+    this._cellsCollapsed = !this._cellsCollapsed;
+    this._saveCellsCollapsed();
+    this._applyCellsCollapsedToRoot();
+    this._syncCellsCollapseUi();
+  }
+
+  _applyCellsCollapsedToRoot() {
+    this.classList.toggle('bp-app--cells-collapsed', this._cellsCollapsed);
+  }
+
+  _syncCellsCollapseUi() {
+    const btns = this.querySelectorAll(
+      'button[data-action="toggle-cells-collapse"]',
+    );
+    const collapsed = this._cellsCollapsed;
+    const label = collapsed ? '展开全部' : '折叠全部';
+    const hint = collapsed
+      ? '当前为「棋盘优先」紧凑视图，点击展开所有编辑控件'
+      : '隐藏每个 Cell 的编辑控件，让棋盘成为主体';
+    btns.forEach((b) => {
+      const btn = /** @type {HTMLButtonElement} */ (b);
+      btn.textContent = label;
+      btn.setAttribute('aria-pressed', collapsed ? 'true' : 'false');
+      btn.title = hint;
+    });
   }
 
   /** @param {KeyboardEvent} e */
@@ -349,8 +657,14 @@ export class BoardPreviewApp extends HTMLElement {
       this._syncIndexToggles(/** @type {HTMLInputElement} */ (t));
     } else if (t.classList.contains('bp-csv-header')) {
       if (this._pendingCsv) this._populateCsvColumnSelect();
+      if (this._csvImported) this._warnReimport();
+    } else if (
+      t.classList.contains('bp-csv-column-select') ||
+      t.classList.contains('bp-csv-tags-select')
+    ) {
+      if (this._csvImported) this._warnReimport();
     } else if (role === 'tags-input') {
-      this._syncTagsInputs(/** @type {HTMLInputElement} */ (t));
+      this._syncTagsInputs(/** @type {HTMLInputElement} */ (t), { commit: true });
     } else if (role === 'zoffset-toggle') {
       this._onZOffsetToggle(/** @type {HTMLInputElement} */ (t));
     } else if (role === 'zoffset-x' || role === 'zoffset-y') {
@@ -364,20 +678,60 @@ export class BoardPreviewApp extends HTMLElement {
     if (!t) return;
     const role = t.dataset?.role;
     if (role === 'tags-input') {
-      this._syncTagsInputs(/** @type {HTMLInputElement} */ (t));
+      this._syncTagsInputs(/** @type {HTMLInputElement} */ (t), { commit: false });
     } else if (role === 'zoffset-x' || role === 'zoffset-y') {
       this._onZOffsetNumberChange(/** @type {HTMLInputElement} */ (t));
     }
   }
 
-  /** @param {HTMLInputElement} source */
-  _syncTagsInputs(source) {
-    this._predefinedTags = this._parsePredefinedTags(source.value);
-    const all = this.querySelectorAll('input[data-role="tags-input"]');
-    all.forEach((inp) => {
+  /**
+   * 同步两个「预设标签」输入框 + 广播给所有 Cell + 删除拦截。
+   *
+   * 两阶段：
+   * - input 阶段（`commit: false`）：实时跟随用户输入，对「被使用的删除」做软保留：
+   *   把仍在被 Cell 使用的标签保留在 `_predefinedTags` 中（broadcast 时不会真正消失），
+   *   但不打扰用户、不回滚输入框文本。
+   * - change 阶段（`commit: true`，由 blur 或回车等触发）：若仍有被保留的删除项，
+   *   把输入框文本硬回滚到 effective 字符串并通过 toast 告知用户原因。
+   *
+   * @param {HTMLInputElement} source
+   * @param {{ commit?: boolean }} [opts]
+   */
+  _syncTagsInputs(source, opts = {}) {
+    const commit = !!opts.commit;
+    const previous = this._predefinedTagsCommitted ?? [];
+    const requested = this._parsePredefinedTags(source.value);
+    const removed = previous.filter((t) => !requested.includes(t));
+    const counts = removed.length
+      ? countTagUsage(this._entries, removed)
+      : Object.create(null);
+    const blocked = removed.filter((t) => (counts[t] ?? 0) > 0);
+    const effective = blocked.length
+      ? [...requested, ...blocked.filter((b) => !requested.includes(b))]
+      : requested;
+
+    const otherInputs = this.querySelectorAll('input[data-role="tags-input"]');
+    otherInputs.forEach((inp) => {
       const el = /** @type {HTMLInputElement} */ (inp);
       if (el !== source) el.value = source.value;
     });
+
+    if (commit && blocked.length) {
+      const joined = effective.join(', ');
+      otherInputs.forEach((inp) => {
+        /** @type {HTMLInputElement} */ (inp).value = joined;
+      });
+      const msg =
+        blocked.length === 1
+          ? `标签「${blocked[0]}」正在被 ${counts[blocked[0]]} 个预览框使用，无法删除`
+          : `下列标签仍在被使用，无法删除：${blocked
+              .map((t) => `「${t}」(${counts[t]})`)
+              .join('、')}`;
+      this._toast(msg, { kind: 'error', ttl: 4500 });
+    }
+
+    this._predefinedTags = effective;
+    this._predefinedTagsCommitted = effective;
     this._broadcastPredefinedTags();
   }
 
@@ -468,6 +822,48 @@ export class BoardPreviewApp extends HTMLElement {
     }
   }
 
+  /**
+   * 在右下角弹出一条轻量 toast；多条并排堆叠，超过 TTL 自动消失。
+   * @param {string} message 显示文案
+   * @param {{ kind?: 'info' | 'success' | 'warn' | 'error', ttl?: number }} [options]
+   */
+  _toast(message, options = {}) {
+    const text = String(message ?? '').trim();
+    if (!text) return;
+    const stack = /** @type {HTMLDivElement | null} */ (
+      this.querySelector('.bp-app__toast-stack')
+    );
+    if (!stack) return;
+    const kind = options.kind === 'success'
+      || options.kind === 'warn'
+      || options.kind === 'error'
+      ? options.kind
+      : 'info';
+    const ttl = Number.isFinite(options.ttl) && options.ttl > 0
+      ? options.ttl
+      : 1800;
+    const item = document.createElement('div');
+    item.className = `bp-toast bp-toast--${kind}`;
+    item.textContent = text;
+    stack.appendChild(item);
+    // 强制下一帧再加 show，触发 transition
+    requestAnimationFrame(() => {
+      item.classList.add('bp-toast--show');
+    });
+    const dismiss = () => {
+      if (!item.isConnected) return;
+      item.classList.remove('bp-toast--show');
+      item.addEventListener(
+        'transitionend',
+        () => {
+          item.remove();
+        },
+        { once: true },
+      );
+    };
+    window.setTimeout(dismiss, ttl);
+  }
+
   /** @param {HTMLInputElement} source */
   _syncIndexToggles(source) {
     const all = this.querySelectorAll('input[data-role="index-toggle"]');
@@ -532,6 +928,14 @@ export class BoardPreviewApp extends HTMLElement {
     this._entries = [];
     this._entryByEl = new WeakMap();
     this._grid.innerHTML = '';
+    // 切换 CSV 后，原来的标签使用数据全部失效；筛选状态也应该自然归零。
+    if (this._isTagFilterActive()) {
+      this._tagFilter.tags.clear();
+      this._tagFilter.includeUntagged = false;
+      this._applyTagFilter();
+      this._syncFilterControls();
+    }
+    this._renderPredefinedSummary();
     this._renderStatus();
   }
 
@@ -557,6 +961,9 @@ export class BoardPreviewApp extends HTMLElement {
     });
     this._refreshSequenceBadges();
     this._renderStatus();
+    // 新增 cell 默认 0 标签，需更新「暂无标签 N」统计与按 untagged 已激活的筛选可见性
+    this._scheduleSummaryRefresh();
+    if (this._isTagFilterActive()) this._applyTagFilter();
     return cell;
   }
 
@@ -668,13 +1075,240 @@ export class BoardPreviewApp extends HTMLElement {
     if (!el) return;
     const total = this._entries.length;
     const hydrated = this._entries.reduce((n, e) => (e.cellEl ? n + 1 : n), 0);
-    if (total === 0 || total === hydrated) {
+    const filterOn = this._isTagFilterActive();
+    const visible = filterOn
+      ? this._entries.reduce((n, e) => (e.el?.hidden ? n : n + 1), 0)
+      : total;
+    const segments = [];
+    if (total > 0 && total !== hydrated) {
+      segments.push(`共 ${total} · 已渲染 ${hydrated}`);
+    } else if (total > 0 && filterOn) {
+      segments.push(`共 ${total}`);
+    }
+    if (filterOn) {
+      segments.push(`显示 ${visible}`);
+    }
+    if (!segments.length) {
       el.hidden = true;
       el.textContent = '';
       return;
     }
     el.hidden = false;
-    el.textContent = `共 ${total} 个预览框 · 已渲染 ${hydrated} 个（继续滚动以加载更多）`;
+    el.textContent = segments.join(' · ');
+  }
+
+  /**
+   * 把后续相邻的 bp-cell-change 合并成一次 summary 刷新；
+   * 大批量水合 / 解码场景下避免每个 Cell 单独触发全量计数。
+   */
+  _scheduleSummaryRefresh() {
+    if (this._summaryRafId != null) return;
+    this._summaryRafId = window.requestAnimationFrame(() => {
+      this._summaryRafId = null;
+      this._renderPredefinedSummary();
+    });
+  }
+
+  /**
+   * 渲染顶部「预设标签使用统计 + 筛选」chip 行。
+   * 数据来源：预设标签 ∪ 任意 entry 用过的标签；按使用数倒序、再按标签名稳定排序。
+   */
+  _renderPredefinedSummary() {
+    const wrap = /** @type {HTMLDivElement | null} */ (
+      this.querySelector('[data-role="tag-stats"]')
+    );
+    if (!wrap) return;
+    const counts = countTagUsage(this._entries, this._predefinedTags);
+    const seen = new Set(this._predefinedTags);
+    const allTags = [...this._predefinedTags];
+    for (const key of Object.keys(counts)) {
+      if (!seen.has(key)) {
+        seen.add(key);
+        allTags.push(key);
+      }
+    }
+    allTags.sort((a, b) => {
+      const da = counts[a] ?? 0;
+      const db = counts[b] ?? 0;
+      if (db !== da) return db - da;
+      return String(a).localeCompare(String(b), 'zh-Hans-CN');
+    });
+    const untaggedCount = this._countUntagged();
+    wrap.innerHTML = '';
+    if (!allTags.length && untaggedCount === 0) {
+      const empty = document.createElement('span');
+      empty.className = 'bp-app__tag-stats-empty';
+      empty.textContent = '暂无标签 — 在上方输入框新增预设后即可使用';
+      wrap.appendChild(empty);
+      this._syncFilterControls();
+      return;
+    }
+    for (const tag of allTags) {
+      const count = counts[tag] ?? 0;
+      const isActive = this._tagFilter.tags.has(tag);
+      const btn = document.createElement('button');
+      btn.type = 'button';
+      btn.className = 'bp-chip bp-app__tag-stat';
+      if (count === 0) btn.classList.add('bp-app__tag-stat--empty');
+      if (isActive) btn.classList.add('bp-app__tag-stat--active');
+      btn.setAttribute('role', 'listitem');
+      btn.setAttribute('data-action', 'toggle-tag-filter');
+      btn.setAttribute('data-tag', tag);
+      btn.setAttribute('aria-pressed', isActive ? 'true' : 'false');
+      btn.title = isActive
+        ? `当前正按「${tag}」筛选（点击取消）`
+        : `按「${tag}」筛选（当前使用：${count}）`;
+      btn.style.setProperty('--chip-h', String(tagHue(tag)));
+      const label = document.createElement('span');
+      label.className = 'bp-chip__label';
+      label.textContent = tag;
+      const cnt = document.createElement('span');
+      cnt.className = 'bp-app__tag-stat-count';
+      cnt.textContent = String(count);
+      btn.appendChild(label);
+      btn.appendChild(cnt);
+      wrap.appendChild(btn);
+    }
+    // 「暂无标签」虚拟 chip：仅当真的存在 0-tag cell 时渲染；和具体标签解耦，不参与色相哈希
+    if (untaggedCount > 0) {
+      const isOn = this._tagFilter.includeUntagged;
+      const btn = document.createElement('button');
+      btn.type = 'button';
+      btn.className = 'bp-chip bp-app__tag-stat bp-app__tag-stat--untagged';
+      if (isOn) btn.classList.add('bp-app__tag-stat--active');
+      btn.setAttribute('role', 'listitem');
+      btn.setAttribute('data-action', 'toggle-untagged-filter');
+      btn.setAttribute('aria-pressed', isOn ? 'true' : 'false');
+      btn.title = isOn
+        ? '当前正在显示「未打标签」的预览框（点击取消）'
+        : `按「未打标签」筛选（当前未打标签：${untaggedCount}）`;
+      const label = document.createElement('span');
+      label.className = 'bp-chip__label';
+      label.textContent = '暂无标签';
+      const cnt = document.createElement('span');
+      cnt.className = 'bp-app__tag-stat-count';
+      cnt.textContent = String(untaggedCount);
+      btn.appendChild(label);
+      btn.appendChild(cnt);
+      wrap.appendChild(btn);
+    }
+    this._syncFilterControls();
+  }
+
+  /** 统计当前没有任何标签的 entry 数量；兼顾已水合与未水合两种状态。 */
+  _countUntagged() {
+    let n = 0;
+    for (const e of this._entries) {
+      if (readEntryTags(e).length === 0) n++;
+    }
+    return n;
+  }
+
+  /** 是否处于任何标签筛选状态（含「无标签」虚拟筛选） */
+  _isTagFilterActive() {
+    return this._tagFilter.tags.size > 0 || this._tagFilter.includeUntagged;
+  }
+
+  /** @param {string | undefined} tag */
+  _toggleTagFilter(tag) {
+    if (!tag) return;
+    if (this._tagFilter.tags.has(tag)) {
+      this._tagFilter.tags.delete(tag);
+    } else {
+      this._tagFilter.tags.add(tag);
+    }
+    this._applyTagFilter();
+    this._renderPredefinedSummary();
+    this._renderStatus();
+  }
+
+  _toggleUntaggedFilter() {
+    this._tagFilter.includeUntagged = !this._tagFilter.includeUntagged;
+    this._applyTagFilter();
+    this._renderPredefinedSummary();
+    this._renderStatus();
+  }
+
+  _toggleFilterMode() {
+    this._tagFilter.mode = this._tagFilter.mode === 'or' ? 'and' : 'or';
+    this._applyTagFilter();
+    this._syncFilterControls();
+    this._renderStatus();
+  }
+
+  _clearTagFilter() {
+    if (!this._isTagFilterActive()) return;
+    this._tagFilter.tags.clear();
+    this._tagFilter.includeUntagged = false;
+    this._applyTagFilter();
+    this._renderPredefinedSummary();
+    this._renderStatus();
+  }
+
+  /**
+   * 把当前 _tagFilter 应用到每个 entry：命中 -> 显示，未命中 -> el.hidden = true。
+   * 隐藏的 entry 不会进入视口，IntersectionObserver 自然不会触发水合；
+   * 已水合的 Cell 不被卸载，保留用户编辑。
+   *
+   * 组合规则：
+   * - OR 模式：(任一 tag 命中) ∪ (includeUntagged ? 无标签 : ∅)
+   * - AND 模式：(全部 tag 命中) ∩ (includeUntagged ? 无标签 : 全集)
+   *   注：AND 下同时勾选具体标签与「无标签」语义为空集（互斥），不再警告
+   */
+  _applyTagFilter() {
+    const active = this._tagFilter.tags;
+    const includeUntagged = this._tagFilter.includeUntagged;
+    const hasFilter = active.size > 0 || includeUntagged;
+    this.classList.toggle('bp-app--filter-on', hasFilter);
+    if (!hasFilter) {
+      for (const e of this._entries) {
+        if (e?.el) e.el.hidden = false;
+      }
+      return;
+    }
+    const mode = this._tagFilter.mode;
+    /** @type {Parameters<typeof matchTagFilter>[1] | null} */
+    const filter = active.size === 0
+      ? null
+      : mode === 'and'
+        ? { all: [...active] }
+        : { any: [...active] };
+    for (const e of this._entries) {
+      if (!e?.el) continue;
+      const tags = readEntryTags(e);
+      const tagHit = filter ? matchTagFilter(tags, filter) : false;
+      const untaggedHit = includeUntagged && tags.length === 0;
+      let visible;
+      if (mode === 'and') {
+        const passTags = filter ? tagHit : true;
+        const passUntagged = includeUntagged ? untaggedHit : true;
+        visible = passTags && passUntagged;
+      } else {
+        visible = tagHit || untaggedHit;
+      }
+      e.el.hidden = !visible;
+    }
+  }
+
+  /** 刷新 OR/AND 切换按钮文案、清空按钮可见性。 */
+  _syncFilterControls() {
+    const modeBtn = /** @type {HTMLButtonElement | null} */ (
+      this.querySelector('button[data-action="toggle-filter-mode"]')
+    );
+    if (modeBtn) {
+      const isAnd = this._tagFilter.mode === 'and';
+      modeBtn.textContent = isAnd ? 'AND' : 'OR';
+      modeBtn.setAttribute('aria-pressed', isAnd ? 'true' : 'false');
+      modeBtn.title = isAnd
+        ? 'AND：必须包含全部已选标签才显示该预览框（点击切换为 OR）'
+        : 'OR：任一已选标签命中即显示该预览框（点击切换为 AND）';
+    }
+    const clearBtn = /** @type {HTMLButtonElement | null} */ (
+      this.querySelector('button[data-action="clear-tag-filter"]')
+    );
+    if (clearBtn) {
+      clearBtn.hidden = !this._isTagFilterActive();
+    }
   }
 
   /** 同步所有跳转组的总数显示、输入框 max 上限与禁用状态 */
@@ -767,6 +1401,14 @@ export class BoardPreviewApp extends HTMLElement {
     const entry = this._entries[seq - 1];
     if (!entry) return;
 
+    if (entry.el?.hidden) {
+      this._toast(
+        `#${seq} 被当前标签筛选隐藏，已自动暂停筛选以跳转到该条`,
+        { kind: 'info', ttl: 3500 },
+      );
+      this._clearTagFilter();
+    }
+
     this._suspendLazyHydration();
 
     const justHydrated = !entry.cellEl;
@@ -842,6 +1484,20 @@ export class BoardPreviewApp extends HTMLElement {
         cell.setPredefinedTags(this._predefinedTags);
       }
     }
+    // 用户改预设标签后，统计行需要立即重排；
+    // 若已激活的筛选项中含被删除的标签，则把它一并从激活集合移除（与 D1 软保留协同）。
+    let filterChanged = false;
+    for (const t of [...this._tagFilter.tags]) {
+      if (!this._predefinedTags.includes(t)) {
+        this._tagFilter.tags.delete(t);
+        filterChanged = true;
+      }
+    }
+    if (filterChanged) {
+      this._applyTagFilter();
+      this._renderStatus();
+    }
+    this._renderPredefinedSummary();
   }
 
   /**
@@ -875,16 +1531,315 @@ export class BoardPreviewApp extends HTMLElement {
     return Boolean(cb?.checked);
   }
 
-  exportCsvAll() {
-    const entries = this._exportEntries();
-    const csv = serializeExportCsv({
+  /**
+   * 把所有导出共用的 serializeExportCsv 选项整理为一处，避免三个调用点遗漏 `tagsColumnIndex`。
+   * @param {import('../io/csv.js').ExportEntry[]} entries
+   * @returns {import('../io/csv.js').ExportCsvOptions}
+   */
+  _buildExportCsvOptions(entries) {
+    return {
       header: this._csvHeader,
       originalColumnCount: this._csvColumnCount,
       entries,
       operatorOf: operationsToGlyphString,
+      tagsOf: (item) => item?.tags ?? [],
+      tagsColumnIndex: this._csvTagsColumnIndex,
       withIndex: this._csvExportWithIndex(),
-    });
+    };
+  }
+
+  exportCsvAll() {
+    const entries = this._exportEntries();
+    if (!entries.length) {
+      this._toast('没有可导出的预览框。', { kind: 'warn' });
+      return;
+    }
+    const csv = serializeExportCsv(this._buildExportCsvOptions(entries));
     downloadTextFile(csv, 'board-preview-export.csv', 'text/csv;charset=utf-8');
+    this._toast(`已导出 ${entries.length} 条到 CSV`, { kind: 'success' });
+  }
+
+  /**
+   * 打开「按标签导出 CSV」多选浮层。
+   * 浮层位于 `<bp-app>` 之下、与所有 Cell 平级，使用 fixed 定位脱离文档流。
+   */
+  _openExportTagModal() {
+    if (this._exportTagModal) return;
+    if (!this._entries.length) {
+      this._toast('当前没有可导出的预览框。', { kind: 'warn' });
+      return;
+    }
+    const tags = this._collectExportModalTagPool();
+    if (!tags.length) {
+      this._toast('当前所有预览框都没有标签。', { kind: 'warn' });
+      return;
+    }
+    const root = document.createElement('div');
+    root.className = 'bp-export-modal';
+    root.setAttribute('role', 'dialog');
+    root.setAttribute('aria-modal', 'true');
+    root.setAttribute('aria-label', '按标签导出 CSV');
+    root.innerHTML = `
+      <div class="bp-export-modal__backdrop" data-action="export-tag-modal-cancel"></div>
+      <div class="bp-export-modal__card" role="document">
+        <header class="bp-export-modal__hdr">
+          <h3 class="bp-export-modal__title">按标签导出 CSV</h3>
+          <button
+            type="button"
+            class="bp-export-modal__close"
+            data-action="export-tag-modal-close"
+            aria-label="关闭"
+          >×</button>
+        </header>
+        <div class="bp-export-modal__body">
+          <div class="bp-export-modal__ctrl">
+            <span class="bp-export-modal__ctrl-label">匹配模式</span>
+            <button
+              type="button"
+              class="bp-btn bp-btn--sm"
+              data-action="export-tag-modal-toggle-mode"
+              data-role="export-mode"
+            >OR</button>
+            <span class="bp-export-modal__hint" data-role="export-mode-hint"></span>
+            <span class="bp-export-modal__spacer"></span>
+            <button
+              type="button"
+              class="bp-btn bp-btn--sm"
+              data-action="export-tag-modal-clear"
+              data-role="export-clear"
+              hidden
+            >清空所选</button>
+          </div>
+          <div class="bp-export-modal__chips" role="list" data-role="export-chips"></div>
+          <div class="bp-export-modal__summary" data-role="export-summary"></div>
+        </div>
+        <footer class="bp-export-modal__ftr">
+          <button
+            type="button"
+            class="bp-btn"
+            data-action="export-tag-modal-cancel"
+          >取消</button>
+          <button
+            type="button"
+            class="bp-btn bp-btn--primary"
+            data-action="export-tag-modal-confirm"
+            data-role="export-confirm"
+            disabled
+          >导出 0 条</button>
+        </footer>
+      </div>
+    `;
+    // 必须挂在 `<bp-app>` 内部，否则委托式 click 监听（this.addEventListener）收不到。
+    this.appendChild(root);
+    this._exportTagModal = {
+      tags: new Set(),
+      mode: 'or',
+      root,
+    };
+    document.addEventListener('keydown', this._onExportTagModalKey);
+    this._renderExportTagModal();
+    // 把焦点送到第一个 chip 或关闭按钮，便于键盘用户
+    const firstChip = /** @type {HTMLElement | null} */ (
+      root.querySelector('[data-action="export-tag-modal-toggle-tag"]')
+    );
+    (firstChip ?? root.querySelector('[data-action="export-tag-modal-close"]'))
+      ?.focus?.();
+  }
+
+  _closeExportTagModal() {
+    const state = this._exportTagModal;
+    if (!state) return;
+    document.removeEventListener('keydown', this._onExportTagModalKey);
+    state.root.remove();
+    this._exportTagModal = null;
+  }
+
+  /**
+   * 浮层渲染：标签 chip 列表 + 计数 + 命中预览 + 模式按钮 + 确认按钮 disabled 状态。
+   */
+  _renderExportTagModal() {
+    const state = this._exportTagModal;
+    if (!state) return;
+    const root = state.root;
+    const counts = countTagUsage(this._entries, this._predefinedTags);
+    const tags = this._collectExportModalTagPool(counts);
+
+    const chipsWrap = /** @type {HTMLElement | null} */ (
+      root.querySelector('[data-role="export-chips"]')
+    );
+    if (chipsWrap) {
+      chipsWrap.innerHTML = '';
+      for (const tag of tags) {
+        const count = counts[tag] ?? 0;
+        const isOn = state.tags.has(tag);
+        const btn = document.createElement('button');
+        btn.type = 'button';
+        btn.className = 'bp-chip bp-app__tag-stat';
+        if (count === 0) btn.classList.add('bp-app__tag-stat--empty');
+        if (isOn) btn.classList.add('bp-app__tag-stat--active');
+        btn.setAttribute('role', 'listitem');
+        btn.setAttribute('data-action', 'export-tag-modal-toggle-tag');
+        btn.setAttribute('data-tag', tag);
+        btn.setAttribute('aria-pressed', isOn ? 'true' : 'false');
+        btn.style.setProperty('--chip-h', String(tagHue(tag)));
+        const label = document.createElement('span');
+        label.className = 'bp-chip__label';
+        label.textContent = tag;
+        const cnt = document.createElement('span');
+        cnt.className = 'bp-app__tag-stat-count';
+        cnt.textContent = String(count);
+        btn.appendChild(label);
+        btn.appendChild(cnt);
+        chipsWrap.appendChild(btn);
+      }
+    }
+
+    const modeBtn = /** @type {HTMLButtonElement | null} */ (
+      root.querySelector('[data-role="export-mode"]')
+    );
+    const modeHint = /** @type {HTMLElement | null} */ (
+      root.querySelector('[data-role="export-mode-hint"]')
+    );
+    if (modeBtn) {
+      const isAnd = state.mode === 'and';
+      modeBtn.textContent = isAnd ? 'AND' : 'OR';
+      modeBtn.setAttribute('aria-pressed', isAnd ? 'true' : 'false');
+    }
+    if (modeHint) {
+      modeHint.textContent =
+        state.mode === 'and'
+          ? '导出同时包含全部已选标签的预览框'
+          : '导出包含任意一个已选标签的预览框';
+    }
+
+    const clearBtn = /** @type {HTMLButtonElement | null} */ (
+      root.querySelector('[data-role="export-clear"]')
+    );
+    if (clearBtn) clearBtn.hidden = state.tags.size === 0;
+
+    const hits = this._computeExportTagHits();
+    const summary = /** @type {HTMLElement | null} */ (
+      root.querySelector('[data-role="export-summary"]')
+    );
+    if (summary) {
+      if (state.tags.size === 0) {
+        summary.textContent = '请至少选择一个标签';
+      } else {
+        summary.textContent = `命中 ${hits.length} / ${this._entries.length} 条`;
+      }
+    }
+
+    const confirmBtn = /** @type {HTMLButtonElement | null} */ (
+      root.querySelector('[data-role="export-confirm"]')
+    );
+    if (confirmBtn) {
+      confirmBtn.disabled = hits.length === 0;
+      confirmBtn.textContent = `导出 ${hits.length} 条`;
+    }
+  }
+
+  /**
+   * 浮层使用的标签池：预设标签 ∪ 任何 entry 用过的标签，按使用数倒序、再按标签名稳定排序。
+   * @param {Record<string, number>} [counts]
+   * @returns {string[]}
+   */
+  _collectExportModalTagPool(counts) {
+    const c = counts ?? countTagUsage(this._entries, this._predefinedTags);
+    const seen = new Set();
+    const pool = [];
+    for (const t of this._predefinedTags) {
+      if (!seen.has(t)) {
+        seen.add(t);
+        pool.push(t);
+      }
+    }
+    for (const t of Object.keys(c)) {
+      if (!seen.has(t)) {
+        seen.add(t);
+        pool.push(t);
+      }
+    }
+    pool.sort((a, b) => {
+      const da = c[a] ?? 0;
+      const db = c[b] ?? 0;
+      if (db !== da) return db - da;
+      return String(a).localeCompare(String(b), 'zh-Hans-CN');
+    });
+    return pool;
+  }
+
+  /** 计算当前浮层选中标签下命中的 entry（完整态，不受 C2 筛选影响）。 */
+  _computeExportTagHits() {
+    const state = this._exportTagModal;
+    if (!state || state.tags.size === 0) return [];
+    const filter =
+      state.mode === 'and'
+        ? { all: [...state.tags] }
+        : { any: [...state.tags] };
+    return this._exportEntries().filter((e) =>
+      matchTagFilter(e.item.tags ?? [], filter),
+    );
+  }
+
+  /** @param {string | undefined} tag */
+  _toggleExportModalTag(tag) {
+    const state = this._exportTagModal;
+    if (!state || !tag) return;
+    if (state.tags.has(tag)) state.tags.delete(tag);
+    else state.tags.add(tag);
+    this._renderExportTagModal();
+  }
+
+  _toggleExportModalMode() {
+    const state = this._exportTagModal;
+    if (!state) return;
+    state.mode = state.mode === 'or' ? 'and' : 'or';
+    this._renderExportTagModal();
+  }
+
+  _clearExportModalSelection() {
+    const state = this._exportTagModal;
+    if (!state || state.tags.size === 0) return;
+    state.tags.clear();
+    this._renderExportTagModal();
+  }
+
+  _confirmExportTagModal() {
+    const state = this._exportTagModal;
+    if (!state || state.tags.size === 0) return;
+    const entries = this._computeExportTagHits();
+    if (!entries.length) {
+      this._toast('当前条件命中 0 条，未导出。', { kind: 'warn' });
+      return;
+    }
+    const csv = serializeExportCsv(this._buildExportCsvOptions(entries));
+    downloadTextFile(
+      csv,
+      this._buildExportTagFilename(state),
+      'text/csv;charset=utf-8',
+    );
+    const tagsText = [...state.tags].map((t) => `「${t}」`).join(state.mode === 'and' ? ' & ' : ' / ');
+    this._toast(
+      `已按 ${tagsText} 导出 ${entries.length} 条到 CSV`,
+      { kind: 'success' },
+    );
+    this._closeExportTagModal();
+  }
+
+  /**
+   * 文件名按 [multi-tag-export.md §4.2] 决定：≤3 个 tag 时拼接；否则用 <n>cond 兜底。
+   * 同时把文件名中的非法字符（`/`、空格、引号等）替换为 `_`，避免下载 API 拒绝。
+   *
+   * @param {{ tags: Set<string>, mode: 'or' | 'and' }} state
+   * @returns {string}
+   */
+  _buildExportTagFilename(state) {
+    const sanitize = (s) => s.replace(/[\\/:*?"<>|\s]+/g, '_').replace(/_+/g, '_');
+    const list = [...state.tags];
+    if (list.length <= 3) {
+      return `board-preview-tags-${list.map(sanitize).join('-')}.csv`;
+    }
+    return `board-preview-tags-${list.length}cond.csv`;
   }
 
   exportCsvByTag() {
@@ -892,30 +1847,105 @@ export class BoardPreviewApp extends HTMLElement {
     if (tag === null) return;
     const needle = tag.trim();
     if (!needle) {
-      window.alert('未输入标签。');
+      this._toast('未输入标签。', { kind: 'warn' });
       return;
     }
     const entries = this._exportEntries().filter((e) =>
       e.item.tags.some((t) => t.includes(needle)),
     );
     if (!entries.length) {
-      window.alert('没有带该标签的预览框。');
+      this._toast(`没有带「${needle}」标签的预览框。`, { kind: 'warn' });
       return;
     }
-    const csv = serializeExportCsv({
-      header: this._csvHeader,
-      originalColumnCount: this._csvColumnCount,
-      entries,
-      operatorOf: operationsToGlyphString,
-      withIndex: this._csvExportWithIndex(),
-    });
+    const csv = serializeExportCsv(this._buildExportCsvOptions(entries));
     downloadTextFile(csv, `board-preview-${needle}.csv`, 'text/csv;charset=utf-8');
+    this._toast(
+      `已按「${needle}」导出 ${entries.length} 条到 CSV`,
+      { kind: 'success' },
+    );
   }
 
   /** @param {HTMLInputElement} input */
   async _onCsvFileChosen(input) {
     const file = input.files?.[0];
     input.value = '';
+    await this._loadCsvFromFile(file);
+  }
+
+  /**
+   * dragover/drop 事件路径上判断载荷是否是文件。
+   * dragover 阶段 `dataTransfer.files` 是 0（浏览器安全限制），
+   * 只能查 `types` 数组里有没有 'Files'。
+   *
+   * @param {DragEvent} e
+   * @returns {boolean}
+   */
+  _isFileDrag(e) {
+    const types = e.dataTransfer?.types;
+    if (!types) return false;
+    return Array.from(types).includes('Files');
+  }
+
+  /** @param {DragEvent} e */
+  _onAppDragEnter(e) {
+    if (!this._isFileDrag(e)) return;
+    e.preventDefault();
+    this._dragCounter++;
+    this.classList.add('bp-app--dragover');
+  }
+
+  /** @param {DragEvent} e */
+  _onAppDragOver(e) {
+    if (!this._isFileDrag(e)) return;
+    e.preventDefault();
+    if (e.dataTransfer) e.dataTransfer.dropEffect = 'copy';
+  }
+
+  /** @param {DragEvent} e */
+  _onAppDragLeave(e) {
+    if (!this._isFileDrag(e)) return;
+    e.preventDefault();
+    this._dragCounter = Math.max(0, this._dragCounter - 1);
+    if (this._dragCounter === 0) {
+      this.classList.remove('bp-app--dragover');
+    }
+  }
+
+  /** @param {DragEvent} e */
+  _onAppDrop(e) {
+    if (!this._isFileDrag(e)) return;
+    e.preventDefault();
+    this._dragCounter = 0;
+    this.classList.remove('bp-app--dragover');
+    const files = Array.from(e.dataTransfer?.files ?? []);
+    if (!files.length) return;
+    const csvFile = files.find(
+      (f) => /\.csv$/i.test(f.name) || f.type === 'text/csv',
+    );
+    if (!csvFile) {
+      const names = files.map((f) => f.name).join('、');
+      this._toast(`仅支持 .csv 文件（收到：${names}）`, {
+        kind: 'warn',
+        ttl: 4000,
+      });
+      return;
+    }
+    if (files.length > 1) {
+      this._toast(
+        `已拖入 ${files.length} 个文件，仅采用第一个 CSV：${csvFile.name}`,
+        { kind: 'info' },
+      );
+    }
+    this._loadCsvFromFile(csvFile);
+  }
+
+  /**
+   * 把一个 File 读为 CSV、写入 `_pendingCsv` 并展开列选择面板。
+   * 文件输入 + 拖拽导入两条路径共用，确保两种来源行为完全一致。
+   *
+   * @param {File | undefined | null} file
+   */
+  async _loadCsvFromFile(file) {
     if (!file) return;
     try {
       const text = await readTextFileUtf8(file);
@@ -925,6 +1955,8 @@ export class BoardPreviewApp extends HTMLElement {
         return;
       }
       this._pendingCsv = { rows, fileName: file.name };
+      // 选了新文件 → 旧的「已导入」状态作废；下次确认导入才会重新置位
+      this._csvImported = false;
       const panel = /** @type {HTMLDivElement} */ (
         this.querySelector('.bp-csv-confirm')
       );
@@ -935,6 +1967,8 @@ export class BoardPreviewApp extends HTMLElement {
       this._populateCsvColumnSelect();
       if (panel) {
         panel.hidden = false;
+        // 拖拽场景下用户没主动滚动到导入区，给一次平滑滚动便于继续操作
+        panel.scrollIntoView({ behavior: 'smooth', block: 'center' });
       }
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
@@ -945,6 +1979,9 @@ export class BoardPreviewApp extends HTMLElement {
   _populateCsvColumnSelect() {
     const sel = /** @type {HTMLSelectElement | null} */ (
       this.querySelector('.bp-csv-column-select')
+    );
+    const tagsSel = /** @type {HTMLSelectElement | null} */ (
+      this.querySelector('.bp-csv-tags-select')
     );
     const headerEl = /** @type {HTMLInputElement | null} */ (
       this.querySelector('.bp-csv-header')
@@ -970,6 +2007,23 @@ export class BoardPreviewApp extends HTMLElement {
           )
         : labels;
     sel.value = String(defaultContentColumnIndex(matchAgainst));
+
+    if (tagsSel) {
+      tagsSel.innerHTML = '';
+      const noneOpt = document.createElement('option');
+      noneOpt.value = '-1';
+      noneOpt.textContent = '无（不导入标签）';
+      tagsSel.appendChild(noneOpt);
+      for (let i = 0; i < labels.length; i++) {
+        const opt = document.createElement('option');
+        opt.value = String(i);
+        opt.textContent = `${labels[i]}（列 ${i}）`;
+        tagsSel.appendChild(opt);
+      }
+      tagsSel.disabled = labels.length === 0;
+      const tagsDefault = defaultTagsColumnIndex(matchAgainst);
+      tagsSel.value = String(tagsDefault);
+    }
   }
 
   _confirmCsvImport() {
@@ -979,6 +2033,9 @@ export class BoardPreviewApp extends HTMLElement {
     }
     const sel = /** @type {HTMLSelectElement | null} */ (
       this.querySelector('.bp-csv-column-select')
+    );
+    const tagsSel = /** @type {HTMLSelectElement | null} */ (
+      this.querySelector('.bp-csv-tags-select')
     );
     const headerEl = /** @type {HTMLInputElement | null} */ (
       this.querySelector('.bp-csv-header')
@@ -992,18 +2049,31 @@ export class BoardPreviewApp extends HTMLElement {
       window.alert('请选择有效列。');
       return;
     }
+    const rawTagsIdx = tagsSel
+      ? Number.parseInt(tagsSel.value, 10)
+      : Number.NaN;
+    const tagsColIndex =
+      Number.isInteger(rawTagsIdx) && rawTagsIdx >= 0 ? rawTagsIdx : null;
+    if (tagsColIndex !== null && tagsColIndex === colIndex) {
+      window.alert('「标签所在列」不能与「关卡串所在列」相同，请重新选择。');
+      return;
+    }
     const firstRowIsHeader = Boolean(headerEl?.checked);
     try {
       const { rows } = this._pendingCsv;
       const dataStart = firstRowIsHeader ? 1 : 0;
-      /** @type {Array<{ levelStr: string, row: string[], csvRow: number }>} */
+      /** @type {Array<{ levelStr: string, row: string[], csvRow: number, tags: string[] }>} */
       const picked = [];
       for (let r = dataStart; r < rows.length; r += 1) {
         const row = rows[r];
         if (!row || row.length <= colIndex) continue;
         const cell = (row[colIndex] ?? '').trim();
         if (!cell) continue;
-        picked.push({ levelStr: cell, row, csvRow: r + 1 });
+        const tags =
+          tagsColIndex !== null && row.length > tagsColIndex
+            ? parseTagsCellValue(row[tagsColIndex])
+            : [];
+        picked.push({ levelStr: cell, row, csvRow: r + 1, tags });
       }
       if (!picked.length) {
         window.alert('所选列中未解析到任何非空关卡串。');
@@ -1012,12 +2082,13 @@ export class BoardPreviewApp extends HTMLElement {
       this._csvHeader =
         firstRowIsHeader && rows.length > 0 ? [...rows[0]] : null;
       this._csvColumnCount = getMaxColumnCount(rows);
+      this._csvTagsColumnIndex = tagsColIndex;
 
       this._resetEntries();
-      for (const { levelStr, row, csvRow } of picked) {
+      for (const { levelStr, row, csvRow, tags } of picked) {
         this._addLazyEntry(
           {
-            tags: [],
+            tags,
             sourceLevelStr: levelStr,
             operations: [],
             levelStr,
@@ -1029,15 +2100,39 @@ export class BoardPreviewApp extends HTMLElement {
       }
       this._refreshSequenceBadges();
       this._renderStatus();
-      this._cancelCsvImport();
+      this._renderPredefinedSummary();
+      this._csvImported = true;
+      this._toast(
+        `已导入 ${picked.length} 条。可在上方修改列选择后再点「确认导入」重新导入。`,
+        { kind: 'success', ttl: 4500 },
+      );
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
       window.alert(`CSV 导入失败：${msg}`);
     }
   }
 
+  /**
+   * 用户修改列选择下拉（或表头开关）时的统一警告：告知"重新导入会丢失 Cell 编辑"
+   * 但不阻止用户继续操作。
+   *
+   * 同一帧内多次触发只发一次，避免某些 UA 的复合事件刷屏。
+   */
+  _warnReimport() {
+    if (this._reimportWarnPending) return;
+    this._reimportWarnPending = true;
+    window.requestAnimationFrame(() => {
+      this._reimportWarnPending = false;
+    });
+    this._toast(
+      '修改列选择后请重新点「确认导入」生效；重新导入会丢失当前 Cell 上的标签与操作编辑。',
+      { kind: 'warn', ttl: 5000 },
+    );
+  }
+
   _cancelCsvImport() {
     this._pendingCsv = null;
+    this._csvImported = false;
     const panel = this.querySelector('.bp-csv-confirm');
     if (panel) {
       panel.hidden = true;
@@ -1049,6 +2144,13 @@ export class BoardPreviewApp extends HTMLElement {
       sel.innerHTML = '';
       sel.disabled = true;
     }
+    const tagsSel = /** @type {HTMLSelectElement | null} */ (
+      this.querySelector('.bp-csv-tags-select')
+    );
+    if (tagsSel) {
+      tagsSel.innerHTML = '';
+      tagsSel.disabled = true;
+    }
     const nameEl = this.querySelector('.bp-csv-confirm__name');
     if (nameEl) {
       nameEl.textContent = '';
@@ -1058,5 +2160,6 @@ export class BoardPreviewApp extends HTMLElement {
 }
 
 BoardPreviewApp.Z_OFFSET_KEY = 'bp:z-offset:v2';
+BoardPreviewApp.CELLS_COLLAPSED_KEY = 'bp:cells-collapsed:v1';
 
 customElements.define('board-preview-app', BoardPreviewApp);

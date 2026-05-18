@@ -1,8 +1,8 @@
 # 提案：多标签导出
 
-> **状态**：📝 Proposed（**未实现**，本文档仅作设计记录）
+> **状态**：📌 Planned — 已审议，待落地（见 §7 决策记录）
 > **范围**：导入导出组件 — CSV 导出按标签过滤
-> **关联**：[导入导出组件](../components/io.md) · [Board 操作集](../components/board-operations.md)
+> **关联**：[导入导出组件](../components/io.md) · [Board 操作集](../components/board-operations.md) · [标签 UX 提升](./tags-ux-enhancements.md)
 
 ## 1. 背景与现状
 
@@ -175,13 +175,37 @@ function matchTagFilter(cellTags, f) {
 - **回退策略**：实现时默认 `mode='exact'` + 单一 OR 列表，与单关键字精确匹配保持兼容；保留一个"模糊匹配"勾选回到子串语义。
 - **数据迁移**：标签存储格式不变（仍是 `string[]`），无需迁移。
 
-## 7. 决策记录（待回填）
+## 7. 决策记录
 
 | 项 | 选项 | 决定 | 时间 |
 |----|------|------|------|
-| UI 形式 | 方案 A / B | 待定 | — |
-| 默认匹配模式 | 精确 / 子串 | 待定 | — |
-| 是否同步改造 JSON 导出 | 是 / 否 | 待定 | — |
-| 文件名规则 | 见 4.2 | 待定 | — |
+| UI 形式 | 方案 A / B | **方案 B**（多选浮层） | 2026-05-18 |
+| 默认匹配模式 | 精确 / 子串 | **精确** | 2026-05-18 |
+| 是否同步改造 JSON 导出 | 是 / 否 | **否**（本期不动 JSON 路径） | 2026-05-18 |
+| 文件名规则 | 见 §4.2 | **按 §4.2** | 2026-05-18 |
+| 旧 prompt 入口去留 | 替换 / 新增并保留 | **新增并保留**（详见 §8） | 2026-05-18 |
+| 是否复用 [tags-ux-enhancements.md](./tags-ux-enhancements.md) 的统计 | 复用 / 自实现 | **复用** `countTagUsage` 与 `tagHue` | 2026-05-18 |
 
-实现后请把本表填好并把"状态"改为 ✅ Implemented，附 commit / PR 链接。
+实现后请把对应项标记为 ✅ Implemented，并在本表追加 commit / PR 链接。
+
+## 8. 兼容性约定（实施细则）
+
+为了不打断既有的"单关键字快速导出"工作流，本期 **新增** 一个入口、**保留** 旧入口：
+
+| 入口 | 文案 | 行为 |
+|------|------|------|
+| 旧（保留） | `按标签导出 CSV` | 沿用现行 `window.prompt` + 子串匹配（[`board-preview-app.js`](../../src/components/board-preview-app.js) 的 `exportCsvByTag`） |
+| 新（新增） | `按标签导出 CSV…`（带省略号示意有浮层） | 弹出方案 B 浮层：多选 + AND/OR 切换 + 命中预览 + Index 列勾选 |
+
+约定：
+
+1. 两个按钮在页头与 sticky 工具条同时呈现，互相独立、状态不共享
+2. 浮层中：
+   - 标签来源 = `_predefinedTags ∪ (所有 entry 当前使用过的标签)`，去重后按使用数倒序展示
+   - 每个标签 chip 沿用 [tags-ux-enhancements.md B1](./tags-ux-enhancements.md) 的颜色哈希 + 计数（B4 的 `countTagUsage`）
+   - 命中预览数实时计算，导出按钮在命中 0 时 disabled
+3. 浮层与 [C2 筛选视图](./tags-ux-enhancements.md) 的关系：
+   - **导出始终遍历全量** `_entries`，不受 C2 当前激活筛选影响
+   - 浮层可提供一个 `[ 沿用当前筛选条件作为初始勾选 ]` 复选框（默认不勾），方便用户从"我现在看到的"出发开始导出
+4. 浮层落地位置：建议 `position: fixed; inset: 0;` 半透明遮罩 + 居中卡片，复用现有 toast 的 `box-shadow` / `border-radius` 习惯，避免引入新的设计语言
+5. ESC、点遮罩、显式「取消」均关闭浮层；浮层内状态不持久化（关闭即清空勾选）
