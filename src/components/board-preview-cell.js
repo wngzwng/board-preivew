@@ -33,6 +33,79 @@ export class BoardPreviewCell extends HTMLElement {
      * @type {{ index: number, total: number, csvRow: number | null } | null}
      */
     this._sequence = null;
+    /**
+     * 由父级广播下来的 Z 轴视觉偏移（仅影响渲染）。
+     * @type {{ enabled: boolean, x: number, y: number }}
+     */
+    this._zOffset = { enabled: false, x: 0, y: 0 };
+  }
+
+  /**
+   * 接收父级的 Z 偏移设置：更新本地状态并刷新棋盘外边距，不重建 tile DOM。
+   * @param {{ enabled: boolean, x: number, y: number }} opts
+   */
+  applyBoardZOffset(opts) {
+    if (!opts || typeof opts !== 'object') return;
+    this._zOffset = {
+      enabled: !!opts.enabled,
+      x: Number.isFinite(opts.x) ? opts.x : 0,
+      y: Number.isFinite(opts.y) ? opts.y : 0,
+    };
+    this._updateBoardZOffsetStyle();
+  }
+
+  /**
+   * 根据当前 _zOffset 与当前棋盘 bounds 计算棋盘容器的 padding，
+   * 为上层 tile 偏出原始范围预留视觉空间。
+   * padding 单位为 % 时是相对父元素（board-wrap）宽度的，而 board 自身 width=100%，
+   * 所以下面的公式直接用 board 宽度的百分比来推导。
+   */
+  _updateBoardZOffsetStyle() {
+    const board = this._boardEl;
+    if (!board) return;
+    const { enabled, x, y } = this._zOffset;
+    if (!enabled || !this._tiles.length) {
+      board.style.removeProperty('--bp-board-pad-top');
+      board.style.removeProperty('--bp-board-pad-right');
+      board.style.removeProperty('--bp-board-pad-bottom');
+      board.style.removeProperty('--bp-board-pad-left');
+      return;
+    }
+    const { xmin, xmax, ymin, ymax, zmin, zmax } = getBounds(this._tiles);
+    const layers = Math.max(0, (zmax ?? 0) - (zmin ?? 0));
+    const colCells = Math.max(1, ymax - ymin + 2);
+    const rowCells = Math.max(1, xmax - xmin + 2);
+    if (layers === 0) {
+      board.style.removeProperty('--bp-board-pad-top');
+      board.style.removeProperty('--bp-board-pad-right');
+      board.style.removeProperty('--bp-board-pad-bottom');
+      board.style.removeProperty('--bp-board-pad-left');
+      return;
+    }
+    // tileWidth = boardWidth * 2/colCells；tileHeight = boardHeight * 2/rowCells；
+    // 两者相等（每格 1fr 1fr 正方形）。
+    // 最高层水平偏移 = layers * tileWidth * |x|%
+    //               = boardWidth * layers * |x| * 2 / colCells / 100
+    // padding-X % 相对 wrap（≈ boardWidth），故 padding% = layers * |x| * 2 / colCells
+    // 垂直方向 padding-top/bottom 的 % 也是相对父宽度，需用对应的 row 维度换算：
+    // 最高层垂直偏移 = layers * tileHeight * |y|% = boardHeight * 2 * layers * |y| / rowCells / 100
+    // 而 padding% 相对 boardWidth = boardHeight * colCells / rowCells，
+    // 所以 padding-top% = (上式 / boardWidth) * 100 = layers * |y| * 2 / colCells
+    // 推导：tileHeight = boardWidth * 2 / colCells（因为是正方形）
+    const factor = 2 / colCells;
+    const padTop = layers * Math.max(0, -y) * factor;
+    const padBottom = layers * Math.max(0, y) * factor;
+    const padLeft = layers * Math.max(0, -x) * factor;
+    const padRight = layers * Math.max(0, x) * factor;
+    board.style.setProperty('--bp-board-pad-top', `${padTop.toFixed(3)}%`);
+    board.style.setProperty('--bp-board-pad-right', `${padRight.toFixed(3)}%`);
+    board.style.setProperty(
+      '--bp-board-pad-bottom',
+      `${padBottom.toFixed(3)}%`,
+    );
+    board.style.setProperty('--bp-board-pad-left', `${padLeft.toFixed(3)}%`);
+    // 备用：避免被遗留 row 维度需要时用到（目前用 colCells 已覆盖正方形格子的情况）
+    void rowCells;
   }
 
   /** @param {string[]} tags */
@@ -87,7 +160,7 @@ export class BoardPreviewCell extends HTMLElement {
           <div class="bp-cell__hdr-sub">
             <button type="button" class="bp-btn bp-btn--sm" data-action="copy-level">复制</button>
             <button type="button" class="bp-btn bp-btn--sm" data-action="paste-level">粘贴</button>
-            <button type="button" class="bp-btn bp-btn--sm" data-action="reset-level">回到原始关卡</button>
+            <button type="button" class="bp-btn bp-btn--sm" data-action="reset-level" aria-label="重置为原始关卡">重置</button>
           </div>
         </div>
       </header>
@@ -116,6 +189,20 @@ export class BoardPreviewCell extends HTMLElement {
         <button type="button" class="bp-btn" data-op="flip_z">Z 反转</button>
       </div>
       <div class="bp-cell__err" role="alert" hidden></div>
+      <div class="bp-cell__bounds" aria-label="棋盘范围" hidden>
+        <span class="bp-cell__bounds-item">
+          <span class="bp-cell__bounds-label">x 最大</span>
+          <span class="bp-cell__bounds-value" data-bounds="x">0</span>
+        </span>
+        <span class="bp-cell__bounds-item">
+          <span class="bp-cell__bounds-label">y 最大</span>
+          <span class="bp-cell__bounds-value" data-bounds="y">0</span>
+        </span>
+        <span class="bp-cell__bounds-item">
+          <span class="bp-cell__bounds-label">z 最大</span>
+          <span class="bp-cell__bounds-value" data-bounds="z">0</span>
+        </span>
+      </div>
       <div class="bp-cell__board-wrap">
         <div class="bp-cell__board"></div>
       </div>
@@ -150,6 +237,9 @@ export class BoardPreviewCell extends HTMLElement {
     this._errEl = /** @type {HTMLDivElement} */ (this.querySelector('.bp-cell__err'));
     this._boardEl = /** @type {HTMLDivElement} */ (
       this.querySelector('.bp-cell__board')
+    );
+    this._boundsEl = /** @type {HTMLDivElement} */ (
+      this.querySelector('.bp-cell__bounds')
     );
     this._toolsEl = /** @type {HTMLDivElement} */ (
       this.querySelector('.bp-cell__tools')
@@ -476,6 +566,27 @@ export class BoardPreviewCell extends HTMLElement {
     this._errEl.hidden = false;
   }
 
+  /**
+   * 更新「x/y/z 最大值」状态行；传入 null 表示空棋盘（隐藏整行）。
+   * @param {{ xmax: number, ymax: number, zmax: number } | null} info
+   */
+  _renderBounds(info) {
+    const el = this._boundsEl;
+    if (!el) return;
+    if (!info) {
+      el.hidden = true;
+      return;
+    }
+    el.hidden = false;
+    const setVal = (key, value) => {
+      const node = el.querySelector(`[data-bounds="${key}"]`);
+      if (node) node.textContent = String(value);
+    };
+    setVal('x', info.xmax);
+    setVal('y', info.ymax);
+    setVal('z', info.zmax);
+  }
+
   _renderBoard() {
     const board = this._boardEl;
     board.innerHTML = '';
@@ -487,10 +598,18 @@ export class BoardPreviewCell extends HTMLElement {
       p.className = 'bp-cell__empty';
       p.textContent = '无牌（解码后显示）';
       board.appendChild(p);
+      this._renderBounds(null);
       return;
     }
 
-    const { xmin, xmax, ymin, ymax } = getBounds(this._tiles);
+    const { xmin, xmax, ymin, ymax, zmin, zmax } = getBounds(this._tiles);
+    // 显示的「最大值」按整盘可达坐标计：tile 锚点 (x, y) 占 2×2 单元格，
+    // 故 x 方向最大可达 xmax + 2、y 方向 ymax + 2；z 是层号（从 0 起），层数 = zmax + 1。
+    this._renderBounds({
+      xmax: xmax + 2,
+      ymax: ymax + 2,
+      zmax: zmax + 1,
+    });
     const rowCells = Math.max(1, xmax - xmin + 2);
     const colCells = Math.max(1, ymax - ymin + 2);
     board.style.gridTemplateRows = `repeat(${rowCells}, 1fr)`;
@@ -505,6 +624,7 @@ export class BoardPreviewCell extends HTMLElement {
       div.style.gridRow = `${t.x - xmin + 1} / span 2`;
       div.style.gridColumn = `${t.y - ymin + 1} / span 2`;
       div.style.zIndex = String(100 + t.z * 10 + (i += 1));
+      div.style.setProperty('--bp-tile-z', String(t.z - (zmin ?? 0)));
       const { base } = tileAssetPaths(t.suit);
       const imgBase = document.createElement('img');
       imgBase.className = 'bp-tile__base';
@@ -525,6 +645,7 @@ export class BoardPreviewCell extends HTMLElement {
       div.appendChild(face);
       board.appendChild(div);
     }
+    this._updateBoardZOffsetStyle();
   }
 }
 

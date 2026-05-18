@@ -40,6 +40,48 @@ export class BoardPreviewApp extends HTMLElement {
     this._entryByEl = new WeakMap();
     /** @type {IntersectionObserver | null} */
     this._observer = null;
+    /**
+     * Z 轴视觉偏移（仅渲染效果，不影响 levelStr / operations / 导出）。
+     * x、y 单位为「棋子宽度的百分比」，可正可负。
+     * 默认开启 + 右上方向偏移（offsetX=+8%、offsetY=-10%）。
+     * @type {{ enabled: boolean, x: number, y: number }}
+     */
+    this._zOffset = this._loadZOffset();
+  }
+
+  /** @returns {{ enabled: boolean, x: number, y: number }} */
+  _defaultZOffset() {
+    return { enabled: true, x: -3, y: -3 };
+  }
+
+  /** 从 localStorage 读取偏移设置，失败时回退默认值 */
+  _loadZOffset() {
+    const defaults = this._defaultZOffset();
+    try {
+      const raw = window.localStorage?.getItem(BoardPreviewApp.Z_OFFSET_KEY);
+      if (!raw) return defaults;
+      const parsed = JSON.parse(raw);
+      return {
+        enabled: typeof parsed.enabled === 'boolean'
+          ? parsed.enabled
+          : defaults.enabled,
+        x: Number.isFinite(parsed.x) ? parsed.x : defaults.x,
+        y: Number.isFinite(parsed.y) ? parsed.y : defaults.y,
+      };
+    } catch {
+      return defaults;
+    }
+  }
+
+  _saveZOffset() {
+    try {
+      window.localStorage?.setItem(
+        BoardPreviewApp.Z_OFFSET_KEY,
+        JSON.stringify(this._zOffset),
+      );
+    } catch {
+      // 隐私模式 / 配额超限时静默
+    }
   }
 
   /** @param {string} raw */
@@ -52,6 +94,70 @@ export class BoardPreviewApp extends HTMLElement {
           .filter(Boolean),
       ),
     );
+  }
+
+  /**
+   * 渲染 Z 轴偏移控件（页头完整版）：开关 + 两个百分比输入 + 重置按钮。
+   * @param {'header'} variant
+   */
+  _zOffsetGroupHtml(variant) {
+    const z = this._zOffset;
+    return `
+      <span class="bp-zoffset bp-zoffset--${variant}" role="group" aria-label="Z 轴偏移控制">
+        <label class="bp-zoffset__toggle">
+          <input
+            type="checkbox"
+            class="bp-zoffset__toggle-input"
+            data-role="zoffset-toggle"
+            ${z.enabled ? 'checked' : ''}
+          />
+          <span>Z 轴偏移</span>
+        </label>
+        <label class="bp-zoffset__field">
+          <span class="bp-zoffset__label">X</span>
+          <input
+            type="number"
+            class="bp-zoffset__input"
+            data-role="zoffset-x"
+            step="1"
+            value="${z.x}"
+            aria-label="X 偏移百分比"
+          />
+          <span class="bp-zoffset__unit">%</span>
+        </label>
+        <label class="bp-zoffset__field">
+          <span class="bp-zoffset__label">Y</span>
+          <input
+            type="number"
+            class="bp-zoffset__input"
+            data-role="zoffset-y"
+            step="1"
+            value="${z.y}"
+            aria-label="Y 偏移百分比"
+          />
+          <span class="bp-zoffset__unit">%</span>
+        </label>
+        <button type="button" class="bp-btn bp-btn--sm" data-action="reset-zoffset" aria-label="重置默认">重置</button>
+      </span>
+    `;
+  }
+
+  /**
+   * 渲染 Z 轴偏移紧凑开关（sticky 版本）：只一个复选框，与页头开关双向同步。
+   * @param {'sticky'} variant
+   */
+  _zOffsetToggleHtml(variant) {
+    const z = this._zOffset;
+    return `
+      <label class="bp-zoffset-toggle bp-zoffset-toggle--${variant}">
+        <input
+          type="checkbox"
+          data-role="zoffset-toggle"
+          ${z.enabled ? 'checked' : ''}
+        />
+        <span>Z 偏移</span>
+      </label>
+    `;
   }
 
   /**
@@ -119,6 +225,10 @@ export class BoardPreviewApp extends HTMLElement {
           ${this._jumpGroupHtml('header')}
           <span class="bp-app__jump-hint">输入序号后按 Enter 或点「跳转」，目标会尽量滚动到视口中央</span>
         </div>
+        <div class="bp-app__zoffset-bar" aria-label="Z 轴偏移">
+          ${this._zOffsetGroupHtml('header')}
+          <span class="bp-app__zoffset-hint">每升一层 z 按棋子宽度的百分比偏移（仅渲染效果，不影响导出）。</span>
+        </div>
         <div class="bp-app__tags" aria-label="预设标签">
           <label class="bp-app__tags-field">
             <span class="bp-app__tags-label">预设标签</span>
@@ -151,6 +261,7 @@ export class BoardPreviewApp extends HTMLElement {
             Index 列
           </label>
           ${this._jumpGroupHtml('sticky')}
+          ${this._zOffsetToggleHtml('sticky')}
         </div>
         <div class="bp-app__sticky-row bp-app__sticky-row--tags">
           <span class="bp-app__sticky-tags-label">预设标签</span>
@@ -178,6 +289,7 @@ export class BoardPreviewApp extends HTMLElement {
 
     this._initObserver();
     this._initStickyBar();
+    this._applyZOffsetToRoot();
 
     if (this._entries.length === 0) {
       this.addCell();
@@ -209,6 +321,9 @@ export class BoardPreviewApp extends HTMLElement {
       case 'jump-to':
         this._jumpFromInput(btn);
         break;
+      case 'reset-zoffset':
+        this._resetZOffset();
+        break;
       default:
     }
   }
@@ -236,6 +351,10 @@ export class BoardPreviewApp extends HTMLElement {
       if (this._pendingCsv) this._populateCsvColumnSelect();
     } else if (role === 'tags-input') {
       this._syncTagsInputs(/** @type {HTMLInputElement} */ (t));
+    } else if (role === 'zoffset-toggle') {
+      this._onZOffsetToggle(/** @type {HTMLInputElement} */ (t));
+    } else if (role === 'zoffset-x' || role === 'zoffset-y') {
+      this._onZOffsetNumberChange(/** @type {HTMLInputElement} */ (t));
     }
   }
 
@@ -243,8 +362,11 @@ export class BoardPreviewApp extends HTMLElement {
   _onDelegatedInput(e) {
     const t = /** @type {HTMLElement | null} */ (e.target);
     if (!t) return;
-    if (t.dataset?.role === 'tags-input') {
+    const role = t.dataset?.role;
+    if (role === 'tags-input') {
       this._syncTagsInputs(/** @type {HTMLInputElement} */ (t));
+    } else if (role === 'zoffset-x' || role === 'zoffset-y') {
+      this._onZOffsetNumberChange(/** @type {HTMLInputElement} */ (t));
     }
   }
 
@@ -257,6 +379,93 @@ export class BoardPreviewApp extends HTMLElement {
       if (el !== source) el.value = source.value;
     });
     this._broadcastPredefinedTags();
+  }
+
+  /** @param {HTMLInputElement} source */
+  _onZOffsetToggle(source) {
+    const enabled = !!source.checked;
+    if (enabled === this._zOffset.enabled) {
+      this._syncZOffsetToggleUi();
+      return;
+    }
+    this._zOffset = { ...this._zOffset, enabled };
+    this._saveZOffset();
+    this._applyZOffsetToRoot();
+    this._syncZOffsetToggleUi();
+    this._broadcastZOffset();
+  }
+
+  /** @param {HTMLInputElement} source */
+  _onZOffsetNumberChange(source) {
+    const role = source.dataset.role;
+    if (role !== 'zoffset-x' && role !== 'zoffset-y') return;
+    const raw = Number(source.value);
+    if (!Number.isFinite(raw)) return;
+    const clamped = Math.max(-200, Math.min(200, raw));
+    const next = { ...this._zOffset };
+    if (role === 'zoffset-x') next.x = clamped;
+    else next.y = clamped;
+    if (next.x === this._zOffset.x && next.y === this._zOffset.y) {
+      return;
+    }
+    this._zOffset = next;
+    this._saveZOffset();
+    this._applyZOffsetToRoot();
+    this._syncZOffsetNumberUi();
+    this._broadcastZOffset();
+  }
+
+  _resetZOffset() {
+    this._zOffset = this._defaultZOffset();
+    this._saveZOffset();
+    this._applyZOffsetToRoot();
+    this._syncZOffsetToggleUi();
+    this._syncZOffsetNumberUi();
+    this._broadcastZOffset();
+  }
+
+  /** 把当前 z 偏移反映到根元素：class 与 CSS 变量（仅渲染层使用） */
+  _applyZOffsetToRoot() {
+    const { enabled, x, y } = this._zOffset;
+    this.classList.toggle('bp-app--zoffset-on', enabled);
+    this.style.setProperty('--bp-zoffset-x', String(x));
+    this.style.setProperty('--bp-zoffset-y', String(y));
+  }
+
+  _syncZOffsetToggleUi() {
+    const checked = this._zOffset.enabled;
+    this.querySelectorAll('input[data-role="zoffset-toggle"]').forEach(
+      (node) => {
+        const el = /** @type {HTMLInputElement} */ (node);
+        if (el.checked !== checked) el.checked = checked;
+      },
+    );
+  }
+
+  _syncZOffsetNumberUi() {
+    const { x, y } = this._zOffset;
+    this.querySelectorAll('input[data-role="zoffset-x"]').forEach((node) => {
+      const el = /** @type {HTMLInputElement} */ (node);
+      if (document.activeElement !== el && Number(el.value) !== x) {
+        el.value = String(x);
+      }
+    });
+    this.querySelectorAll('input[data-role="zoffset-y"]').forEach((node) => {
+      const el = /** @type {HTMLInputElement} */ (node);
+      if (document.activeElement !== el && Number(el.value) !== y) {
+        el.value = String(y);
+      }
+    });
+  }
+
+  /** 把最新偏移广播给已水合的 cell，让其更新棋盘边距 */
+  _broadcastZOffset() {
+    for (const entry of this._entries) {
+      const cell = entry.cellEl;
+      if (cell && typeof cell.applyBoardZOffset === 'function') {
+        cell.applyBoardZOffset(this._zOffset);
+      }
+    }
   }
 
   /** @param {HTMLInputElement} source */
@@ -417,6 +626,9 @@ export class BoardPreviewApp extends HTMLElement {
     entry.cellEl = cell;
     if (typeof cell.setPredefinedTags === 'function') {
       cell.setPredefinedTags(this._predefinedTags);
+    }
+    if (typeof cell.applyBoardZOffset === 'function') {
+      cell.applyBoardZOffset(this._zOffset);
     }
     if (entry.originalRow) {
       cell.setOriginalCsvRow(entry.originalRow);
@@ -844,5 +1056,7 @@ export class BoardPreviewApp extends HTMLElement {
   }
 
 }
+
+BoardPreviewApp.Z_OFFSET_KEY = 'bp:z-offset:v2';
 
 customElements.define('board-preview-app', BoardPreviewApp);
