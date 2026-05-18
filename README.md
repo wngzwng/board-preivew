@@ -27,4 +27,24 @@ Board 预览（Tile3 / 羊了个羊式叠层关卡）
 - **CSV 导入**：选择文件后自动解析并在下拉框列出列名（首行表头时取自表头；默认选中 **Content** 列），点「确认导入」写入预览框。
 - **CSV 导出**：保留导入时的原始列，并追加 4 列：`sourceLevel`、`operator`（如 `LXZ`）、`targetLevel`、`HasZOperator`。
 
+## 打包：合成单文件 `index.html`
+
+把 HTML / CSS / 所有 ES Module 源码 / `src/assets/` 下的图片资源全部内联到一个独立的 `index.html`，方便部署或离线分发。
+
+```bash
+npm run build                              # 默认输出 dist/index.html
+node scripts/bundle.js                     # 等价命令
+node scripts/bundle.js --out=foo.html      # 自定义输出路径（相对项目根）
+```
+
+要点：
+
+- 打包器 [`scripts/bundle.js`](scripts/bundle.js) **零运行时依赖**，仅使用 Node 自带的 `fs/path/url`；遵循"不引入第三方库"的项目宪法。
+- 从 `src/main.js` 入口构建 ESM 依赖图并拓扑排序，把每个模块包成 IIFE 写入共享 `__M` 缓存，模拟 ES Module 语义。
+- `src/assets/` 下所有已知后缀（png/jpg/jpeg/gif/webp/svg）的资源会被读为 base64 并注入到 `globalThis.__BP_ASSETS`；`src/assets/tileSources.js` 的查表 fallback 会把运行时拼出的相对路径自动替换为 `data:...`。开发期 `__BP_ASSETS` 不存在，行为不变。
+- 输出体积、模块清单与资源清单会在终端打印，便于观察 bundle 构成。
+- 产物默认在 `dist/`（已加入 `.gitignore`）。直接用浏览器打开生成的 HTML 即可（部分浏览器对 `file://` 协议有限制时仍建议挂到任意静态服务）。
+
+打包器支持的 ESM 形态对应本项目当前用法：相对路径 `import`、副作用 `import`、命名 `import { a, b }`（含多行）、`export const/let/var/function/function*/class`。遇到未支持的写法（`export default`、`import * as ns`、`export {}` 等）会显式抛错而非静默丢失，便于扩展时及时发现。
+
 技术栈：HTML、CSS、Js， 不需要第三方库，封装组件可使用 webcomponent技术

@@ -21,8 +21,15 @@ export function resolveTileVariant(suit) {
 /** @param {string} suit @returns {{ base: string, card: string }} */
 export function tileAssetPaths(suit) {
   const v = resolveTileVariant(suit);
-  return {
-    base: `${ASSETS_BASE}/tilebase_${v}.png`,
-    card: `${ASSETS_BASE}/tilebase_card_${v}.png`,
-  };
+  const base = `${ASSETS_BASE}/tilebase_${v}.png`;
+  const card = `${ASSETS_BASE}/tilebase_card_${v}.png`;
+  // 打包后由 scripts/bundle.js 注入 `globalThis.__BP_ASSETS`，
+  // 把相对路径映射为内联的 data URL；开发期此对象不存在，走原相对路径。
+  const table = /** @type {Record<string, string> | undefined} */ (
+    /** @type {any} */ (globalThis).__BP_ASSETS
+  );
+  if (table) {
+    return { base: table[base] ?? base, card: table[card] ?? card };
+  }
+  return { base, card };
 }
