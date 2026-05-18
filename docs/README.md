@@ -61,6 +61,12 @@
 - [组件文档索引](components/README.md)
 - [Board 操作集](components/board-operations.md)（左右旋转 / XY 镜像 / Z 轴反转的公式、2×2 占格与锚点重整、`(z,x,y)` 后置排序、`operations` 记录与回放、`hadZAxisOperation` 单调升、CSV 四列附加）
 
+## 提案（设计记录）
+
+未实现但已有方案记录的特性放在 **`docs/proposals/`**，每份文档说明现状、目标语义、UI 取舍、实现要点、验收标准与决策记录。
+
+- [多标签导出](proposals/multi-tag-export.md)（OR / AND / NOT 过滤；当前实现仅支持单关键字子串匹配，**暂不实现**）
+
 ## 技术栈
 
 - **HTML、CSS、JavaScript**
