@@ -492,7 +492,16 @@ export class BoardPreviewCell extends HTMLElement {
     try {
       const text = await navigator.clipboard.readText();
       this._levelTextarea.value = text;
-      this._emitToast('已从剪贴板粘贴', 'success');
+      // 有原始关卡时，提醒用户：再点「解码 / 应用」会把原始关卡覆盖为这次粘贴的内容，
+      // 此后「重置」将不再能回到旧关卡。仅在已记录原始关卡时发出，避免无谓打扰。
+      if (this._sourceLevelStr) {
+        this._emitToast(
+          '已粘贴 — 注意：点击「解码 / 应用」会覆盖当前的原始关卡',
+          'warn',
+        );
+      } else {
+        this._emitToast('已从剪贴板粘贴', 'success');
+      }
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
       this._setError(`粘贴失败：${msg}（请检查浏览器权限）`);
