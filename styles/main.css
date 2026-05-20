@@ -360,7 +360,8 @@ board-preview-app {
   font-size: 0.78rem;
 }
 
-.bp-zoffset-toggle {
+.bp-zoffset-toggle,
+.bp-offset-toggle {
   display: inline-flex;
   align-items: center;
   gap: 0.3rem;
@@ -374,8 +375,63 @@ board-preview-app {
   user-select: none;
 }
 
-.bp-zoffset-toggle input {
+.bp-zoffset-toggle input,
+.bp-offset-toggle input {
   margin: 0;
+}
+
+/*
+ * 全局开关关闭时整个 chip 淡化，与正文形成弱对比，提示"当前不生效"。
+ * 用 :has() 探测内部 checkbox 状态；不支持的浏览器仍可工作（仅丢失淡化效果）。
+ */
+.bp-zoffset-toggle:has(input:not(:checked)),
+.bp-offset-toggle:has(input:not(:checked)) {
+  opacity: 0.55;
+}
+
+/*
+ * Offset 组合 chip：开关 + 单位 % 输入并排，整体作为一个 group 视觉单元，
+ * 紧贴在 Z 偏移整组之左（见 toolbar HTML）。
+ */
+.bp-offset-group {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.3rem;
+}
+
+.bp-offset-unit {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.25rem;
+  font-size: 0.78rem;
+  color: var(--bp-muted);
+  user-select: none;
+}
+
+.bp-offset-unit__label {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+
+.bp-offset-unit__suffix {
+  color: var(--bp-muted);
+  font-size: 0.75rem;
+}
+
+.bp-offset-unit__input {
+  width: 3rem;
+  padding: 0.2rem 0.35rem;
+  font-size: 0.82rem;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  color: var(--bp-text);
+  background: var(--bp-bg);
+  border: 1px solid var(--bp-border);
+  border-radius: 6px;
+}
+
+/* offset 开关关闭时，单位输入也随之淡化，强化"全组不生效"语义。 */
+.bp-offset-group:has(input[data-role="offset-toggle"]:not(:checked))
+  .bp-offset-unit {
+  opacity: 0.55;
 }
 
 @keyframes bp-jump-flash {
@@ -597,6 +653,48 @@ board-preview-cell {
   border: 1px solid var(--bp-border);
   border-radius: 8px;
   resize: vertical;
+}
+
+/*
+ * Offset 串紧凑行：单行 textarea + 两个小按钮（复制 / 粘贴）；
+ * 与 level 串区分但视觉上明确从属，避免抢主关卡的注意力。
+ */
+.bp-cell__offset {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+  align-items: flex-end;
+  margin: 0 0 0.6rem;
+  padding: 0.4rem 0.55rem;
+  background: rgba(20, 32, 48, 0.55);
+  border: 1px dashed var(--bp-border);
+  border-radius: 8px;
+}
+
+.bp-cell__offset .bp-cell__label {
+  flex: 1 1 220px;
+  gap: 0.2rem;
+}
+
+.bp-cell__offset-str {
+  width: 100%;
+  min-height: 1.8rem;
+  padding: 0.35rem 0.5rem;
+  font-family: ui-monospace, monospace;
+  font-size: 0.78rem;
+  color: var(--bp-text);
+  background: var(--bp-bg);
+  border: 1px solid var(--bp-border);
+  border-radius: 6px;
+  resize: vertical;
+}
+
+.bp-cell__offset-side {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.3rem;
+  flex-shrink: 0;
+  align-items: center;
 }
 
 .bp-cell__tags {
@@ -1069,11 +1167,13 @@ board-preview-cell {
 }
 
 .bp-cell__board {
-  display: grid;
-  gap: 2px;
+  /*
+   * outer：只承担 padding（给 Z 偏移与 offset 的视觉超出预留空间）+ 背景 + 边框。
+   * 把 aspect-ratio 与 grid 下沉到 inner（.bp-cell__board-grid）后，
+   * 这里 padding 不对称也不会扭曲 inner 的 colCells:rowCells 比例，
+   * grid 1fr × 1fr 单元格永远保持正方形。
+   */
   width: 100%;
-  /* aspect-ratio 由 JS 按 列数/行数 写入，确保 1fr×1fr 单元格为正方形 */
-  /* Z 轴偏移开启时，--bp-board-pad-* 由 JS 注入百分比，给上层 tile 预留视觉空间 */
   padding:
     calc(10px + var(--bp-board-pad-top, 0%))
     calc(10px + var(--bp-board-pad-right, 0%))
@@ -1086,10 +1186,20 @@ board-preview-cell {
   transition: padding 0.18s ease;
 }
 
-.bp-cell__board:has(> .bp-cell__empty) {
-  /* 空状态时取消纵横比限制，避免高度被压扁/拉伸 */
-  aspect-ratio: auto;
+.bp-cell__board-grid {
+  display: grid;
+  gap: 2px;
+  width: 100%;
+  /* aspect-ratio 由 JS 按 列数/行数 写入，确保 1fr×1fr 单元格为正方形 */
+}
+
+.bp-cell__board:has(.bp-cell__empty) {
+  /* 空状态时取消高度自适应，避免被压扁/拉伸 */
   min-height: 100px;
+}
+
+.bp-cell__board-grid:has(> .bp-cell__empty) {
+  aspect-ratio: auto;
 }
 
 .bp-cell__empty {
@@ -1108,19 +1218,51 @@ board-preview-cell {
   background: #153528;
   box-shadow: 0 2px 8px rgba(0, 0, 0, 0.5);
   transition: transform 0.18s ease;
+  /*
+   * 视觉偏移合成 = 全局 Z 偏移分量 + 柱子级 Offset 分量，两者皆受全局开关控制：
+   *
+   *   --bp-zoffset-on     ∈ {0, 1}  : Z 偏移开关（由 .bp-app--zoffset-on 切换）
+   *   --bp-offset-on      ∈ {0, 1}  : Offset 开关（由 .bp-app--offset-on 切换）
+   *   --bp-offset-unit-pct ∈ [1, 5] : Offset 单层增量缩放系数（应用层可调，默认 1）
+   *
+   * 全局 Z 偏移分量（所有柱子方向 + 档位都相同）：
+   *   tile_z × zoffset_x/y × 1%   ← 棋子宽度的百分比
+   * 柱子级 Offset 分量（每根柱子方向 + 档位独立，"逐层累加"）：
+   *   tile_offset_x/y × unit_pct × 1%
+   *     ↑ JS 注入"方向×档位×层差"的无量纲值       ↑ 单位百分比 在此统一缩放
+   *
+   * 两者本质同质（都是"每升一层 translate"），仅作用范围不同：
+   * Z 偏移作用全盘，offset 只作用于命中的那根柱。
+   * 每个分量都乘以对应的 0/1 开关，关闭时归零、互不影响。
+   * unit_pct 变化时此公式自动重算，无需 JS 重建 tile DOM。
+   */
+  transform: translate(
+    calc(
+      var(--bp-tile-z, 0) * var(--bp-zoffset-x, 0) * var(--bp-zoffset-on, 0)
+        * 1%
+        + var(--bp-tile-offset-x, 0) * var(--bp-offset-unit-pct, 1)
+        * var(--bp-offset-on, 0) * 1%
+    ),
+    calc(
+      var(--bp-tile-z, 0) * var(--bp-zoffset-y, 0) * var(--bp-zoffset-on, 0)
+        * 1%
+        + var(--bp-tile-offset-y, 0) * var(--bp-offset-unit-pct, 1)
+        * var(--bp-offset-on, 0) * 1%
+    )
+  );
 }
 
 /*
- * Z 轴偏移：仅渲染层效果，不影响坐标 / 导出。
- * --bp-tile-z 为以最底层为 0 的层差，单位无；
- * --bp-zoffset-x / --bp-zoffset-y 为「棋子宽度的百分比」，单位无；
- * translate() 内的百分比相对 tile 自身尺寸，故得到「层数 × X%」的偏移。
+ * class 与 CSS 数值开关双向绑定：
+ * - class 用于受影响的其它样式（例如棋盘 padding 预留 Z 偏移空间）
+ * - 数值变量用于上面的 transform calc，关闭时把对应分量乘 0
  */
-.bp-app--zoffset-on .bp-tile {
-  transform: translate(
-    calc(var(--bp-tile-z, 0) * var(--bp-zoffset-x, 0) * 1%),
-    calc(var(--bp-tile-z, 0) * var(--bp-zoffset-y, 0) * 1%)
-  );
+.bp-app--zoffset-on {
+  --bp-zoffset-on: 1;
+}
+
+.bp-app--offset-on {
+  --bp-offset-on: 1;
 }
 
 .bp-tile__base,
@@ -1186,7 +1328,8 @@ code {
 .bp-app--cells-collapsed .bp-cell__tools,
 .bp-app--cells-collapsed .bp-cell__op-log,
 .bp-app--cells-collapsed .bp-cell__label-text,
-.bp-app--cells-collapsed .bp-cell__tags-empty {
+.bp-app--cells-collapsed .bp-cell__tags-empty,
+.bp-app--cells-collapsed .bp-cell__offset {
   display: none !important;
 }
 

@@ -8,8 +8,11 @@ import {
   APPENDED_EXPORT_COLUMNS,
   INDEX_COLUMN_NAME,
   TAGS_COLUMN_NAME,
+  OFFSET_COLUMN_NAME,
   getColumnLabelsFromRows,
   defaultContentColumnIndex,
+  defaultTagsColumnIndex,
+  defaultOffsetColumnIndex,
 } from '../src/io/csv.js';
 import { operationsToGlyphString } from '../src/board/operationGlyphs.js';
 
@@ -45,7 +48,7 @@ test('表头列名', () => {
   assert.deepEqual(extractLevelStringsFromRows(rows, spec), ['AAA', 'BBB']);
 });
 
-test('导出 CSV：保留原始列 + 追加新 4 列（识别到 tags 列时覆盖该列，避免回环导入列重复）', () => {
+test('导出 CSV：识别到 tags 列时覆盖该列（默认追加 Offset 主列在 Tags 之后）', () => {
   const csv = serializeExportCsv({
     header: ['id', 'tags', 'Content'],
     entries: [
@@ -56,6 +59,8 @@ test('导出 CSV：保留原始列 + 追加新 4 列（识别到 tags 列时覆�
           tags: ['a', 'b'],
           sourceLevelStr: '006.26,8.42,6.60,2,4.82',
           levelStr: '002,20,2,4,4.82',
+          sourceOffsetStr: '',
+          offsetStr: '',
           operations: [
             { type: 'rotate_left', payload: {} },
             { type: 'mirror_x', payload: {} },
@@ -73,17 +78,24 @@ test('导出 CSV：保留原始列 + 追加新 4 列（识别到 tags 列时覆�
     'id',
     'tags',
     'Content',
+    OFFSET_COLUMN_NAME,
     ...APPENDED_EXPORT_COLUMNS,
   ]);
-  assert.equal(rows[1].length, 3 + APPENDED_EXPORT_COLUMNS.length);
+  // 原始 3 列 + 追加 Offset 主列 + 6 个元数据列 = 10
+  assert.equal(rows[1].length, 3 + 1 + APPENDED_EXPORT_COLUMNS.length);
   assert.deepEqual(rows[1].slice(0, 3), ['67024747', 'a|b', '002,20,2,4,4']);
-  assert.equal(rows[1][3], '006.26,8.42,6.60,2,4.82');
-  assert.equal(rows[1][4], 'LX');
-  assert.equal(rows[1][5], '002,20,2,4,4.82');
-  assert.equal(rows[1][6], '0');
+  // Offset 主列（空 → ''）
+  assert.equal(rows[1][3], '');
+  // 元数据：sourceLevel, sourceOffset, operator, targetLevel, targetOffset, HasZOperator
+  assert.equal(rows[1][4], '006.26,8.42,6.60,2,4.82');
+  assert.equal(rows[1][5], ''); // sourceOffset
+  assert.equal(rows[1][6], 'LX'); // operator
+  assert.equal(rows[1][7], '002,20,2,4,4.82'); // targetLevel
+  assert.equal(rows[1][8], ''); // targetOffset
+  assert.equal(rows[1][9], '0'); // HasZOperator
 });
 
-test('导出 CSV：未识别到 tags 列时在原始列后追加 Tags 列', () => {
+test('导出 CSV：未识别到 tags/offset 列时在原始列后追加 Tags + Offset 主列', () => {
   const csv = serializeExportCsv({
     header: ['id', 'Content'],
     entries: [
@@ -94,6 +106,8 @@ test('导出 CSV：未识别到 tags 列时在原始列后追加 Tags 列', () =
           tags: ['easy', 'wip'],
           sourceLevelStr: 'src',
           levelStr: 'tgt',
+          sourceOffsetStr: '000A',
+          offsetStr: '001B',
           operations: [],
           meta: { hadZAxisOperation: false },
         },
@@ -106,14 +120,53 @@ test('导出 CSV：未识别到 tags 列时在原始列后追加 Tags 列', () =
     'id',
     'Content',
     TAGS_COLUMN_NAME,
+    OFFSET_COLUMN_NAME,
     ...APPENDED_EXPORT_COLUMNS,
   ]);
   assert.equal(rows[1][0], '1');
   assert.equal(rows[1][1], 'lv');
-  assert.equal(rows[1][2], 'easy|wip');
+  assert.equal(rows[1][2], 'easy|wip'); // Tags 主列
+  assert.equal(rows[1][3], '001B'); // Offset 主列（= offsetStr）
+  assert.equal(rows[1][4], 'src'); // sourceLevel
+  assert.equal(rows[1][5], '000A'); // sourceOffset
+  assert.equal(rows[1][7], 'tgt'); // targetLevel
+  assert.equal(rows[1][8], '001B'); // targetOffset = offsetStr
 });
 
-test('导出 CSV：无原始 CSV 时退化为占位列', () => {
+test('导出 CSV：识别到 offset 列时覆盖（与 Tags 同策略）', () => {
+  const csv = serializeExportCsv({
+    header: ['id', 'Offset', 'Content'],
+    entries: [
+      {
+        originalRow: ['1', 'OLD', 'lv'],
+        item: {
+          id: '1',
+          tags: [],
+          sourceLevelStr: 'src',
+          levelStr: 'tgt',
+          sourceOffsetStr: 'OLD',
+          offsetStr: 'NEW',
+          operations: [],
+          meta: { hadZAxisOperation: false },
+        },
+      },
+    ],
+    operatorOf: operationsToGlyphString,
+    offsetColumnIndex: 1,
+  });
+  const rows = parseCsv(csv);
+  // Offset 主列识别 → 覆盖；Tags 未识别 → 追加
+  assert.deepEqual(rows[0], [
+    'id',
+    'Offset',
+    'Content',
+    TAGS_COLUMN_NAME,
+    ...APPENDED_EXPORT_COLUMNS,
+  ]);
+  assert.equal(rows[1][1], 'NEW'); // 覆盖原 'OLD'
+});
+
+test('导出 CSV：无原始 CSV 时退化为占位列（Tags + Offset + 6 元数据）', () => {
   const csv = serializeExportCsv({
     header: null,
     originalColumnCount: 0,
@@ -125,6 +178,8 @@ test('导出 CSV：无原始 CSV 时退化为占位列', () => {
           tags: [],
           sourceLevelStr: 'src',
           levelStr: 'tgt',
+          sourceOffsetStr: '',
+          offsetStr: '',
           operations: [{ type: 'flip_z' }],
           meta: { hadZAxisOperation: true },
         },
@@ -134,8 +189,12 @@ test('导出 CSV：无原始 CSV 时退化为占位列', () => {
   });
   const body = csv.replace(/^\uFEFF/, '');
   const [header, row] = body.split('\r\n');
-  assert.equal(header, [TAGS_COLUMN_NAME, ...APPENDED_EXPORT_COLUMNS].join(','));
-  assert.equal(row, ',src,Z,tgt,1');
+  assert.equal(
+    header,
+    [TAGS_COLUMN_NAME, OFFSET_COLUMN_NAME, ...APPENDED_EXPORT_COLUMNS].join(','),
+  );
+  // Tags='' | Offset='' | sourceLevel=src | sourceOffset='' | operator=Z | targetLevel=tgt | targetOffset='' | HasZOperator=1
+  assert.equal(row, ',,src,,Z,tgt,,1');
 });
 
 test('导出 CSV：可选 Index 列（1 起自增，且在原始列之前）', () => {
@@ -146,6 +205,8 @@ test('导出 CSV：可选 Index 列（1 起自增，且在原始列之前）', (
       tags: [],
       sourceLevelStr: 'src',
       levelStr: 'tgt',
+      sourceOffsetStr: '',
+      offsetStr: '',
       operations: [],
       meta: { hadZAxisOperation: false },
     },
@@ -162,6 +223,7 @@ test('导出 CSV：可选 Index 列（1 起自增，且在原始列之前）', (
     'id',
     'Content',
     TAGS_COLUMN_NAME,
+    OFFSET_COLUMN_NAME,
     ...APPENDED_EXPORT_COLUMNS,
   ]);
   assert.deepEqual(
@@ -184,6 +246,8 @@ test('导出 CSV：indexStart 可自定义起点', () => {
           tags: [],
           sourceLevelStr: '',
           levelStr: '',
+          sourceOffsetStr: '',
+          offsetStr: '',
           operations: [],
           meta: { hadZAxisOperation: false },
         },
@@ -202,6 +266,16 @@ test('defaultContentColumnIndex: 默认 Content', () => {
   assert.equal(defaultContentColumnIndex(['Id', 'Content', 'Other']), 1);
   assert.equal(defaultContentColumnIndex(['x', 'y']), 0);
   assert.equal(defaultContentColumnIndex(['CONTENT']), 0);
+});
+
+test('defaultTagsColumnIndex / defaultOffsetColumnIndex: 找到则返回索引，无则 -1', () => {
+  assert.equal(defaultTagsColumnIndex(['id', 'Tags', 'Content']), 1);
+  assert.equal(defaultTagsColumnIndex(['id', 'Content']), -1);
+  assert.equal(defaultOffsetColumnIndex(['id', 'Offset', 'Content']), 1);
+  assert.equal(defaultOffsetColumnIndex(['id', 'Content']), -1);
+  // 大小写无关
+  assert.equal(defaultOffsetColumnIndex(['OFFSET']), 0);
+  assert.equal(defaultOffsetColumnIndex(['offset']), 0);
 });
 
 test('getColumnLabelsFromRows: 表头与无表头', () => {

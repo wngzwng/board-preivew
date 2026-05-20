@@ -11,6 +11,9 @@ export const DEFAULT_CONTENT_COLUMN = 'Content';
 /** 默认 Tags 所在列表头名（不区分大小写） */
 export const DEFAULT_TAGS_COLUMN = 'Tags';
 
+/** 默认 Offset 所在列表头名（不区分大小写） */
+export const DEFAULT_OFFSET_COLUMN = 'Offset';
+
 /**
  * Tags 单元格在 CSV 中使用的写出分隔符。
  * - 选用 `|` 而非 `,`：避免被 CSV 引擎再包一层双引号，肉眼可读
@@ -66,6 +69,20 @@ export function joinTagsForCsv(tags) {
  */
 export function defaultTagsColumnIndex(headerLikeLabels) {
   const want = DEFAULT_TAGS_COLUMN.toLowerCase();
+  return headerLikeLabels.findIndex(
+    (l) => String(l ?? '').trim().toLowerCase() === want,
+  );
+}
+
+/**
+ * 匹配 {@link DEFAULT_OFFSET_COLUMN} 的列索引；无匹配则 -1（"没有 Offset 列"是合法默认）。
+ * 与 {@link defaultTagsColumnIndex} 同策略。
+ *
+ * @param {string[]} headerLikeLabels
+ * @returns {number}
+ */
+export function defaultOffsetColumnIndex(headerLikeLabels) {
+  const want = DEFAULT_OFFSET_COLUMN.toLowerCase();
   return headerLikeLabels.findIndex(
     (l) => String(l ?? '').trim().toLowerCase() === want,
   );
@@ -279,11 +296,19 @@ function escapeCsvField(s) {
   return t;
 }
 
-/** 追加在「保留原始列」之后的新列名（顺序固定） */
+/**
+ * 追加在「保留原始列」之后的元数据列名（顺序固定）。
+ *
+ * `sourceOffset / targetOffset` 紧贴 `sourceLevel / targetLevel`，与 offset 的
+ * "原始 / 当前"语义对齐；与 `Offset` 主列（在 Tags 之后）是两套独立通道：
+ * 元数据列**永远输出**（即使所有 cell 都空 offset），便于下游统一处理。
+ */
 export const APPENDED_EXPORT_COLUMNS = Object.freeze([
   'sourceLevel',
+  'sourceOffset',
   'operator',
   'targetLevel',
+  'targetOffset',
   'HasZOperator',
 ]);
 
@@ -292,6 +317,9 @@ export const INDEX_COLUMN_NAME = 'Index';
 
 /** 追加 Tags 列时使用的表头名 */
 export const TAGS_COLUMN_NAME = 'Tags';
+
+/** 追加 Offset 主列时使用的表头名 */
+export const OFFSET_COLUMN_NAME = 'Offset';
 
 /**
  * @typedef {{
@@ -306,6 +334,10 @@ export const TAGS_COLUMN_NAME = 'Tags';
  *   operatorOf: (ops: Array<{ type: string }>) => string,
  *   tagsOf?: (item: import('./bundle.js').BundleItem) => readonly string[],
  *   tagsColumnIndex?: number | null,     // 导入时识别到的 Tags 列索引；null=没有，导出会追加新列
+ *   offsetOf?: (item: import('./bundle.js').BundleItem) => string,
+ *   offsetColumnIndex?: number | null,   // 导入时识别到的 Offset 列索引；null=没有，导出会追加新列
+ *   sourceOffsetOf?: (item: import('./bundle.js').BundleItem) => string,
+ *   targetOffsetOf?: (item: import('./bundle.js').BundleItem) => string,
  *   withBom?: boolean,
  *   withIndex?: boolean,                  // 在最前追加 1 起的自增 Index 列
  *   indexStart?: number,                  // 自增起始值（默认 1）
@@ -313,15 +345,14 @@ export const TAGS_COLUMN_NAME = 'Tags';
  */
 
 /**
- * 导出 CSV：保留原始 CSV 的列，追加 `Tags` 与四个生成列：
- * `Tags, sourceLevel, operator, targetLevel, HasZOperator`。
+ * 导出 CSV：保留原始 CSV 的列，追加 `Tags` / `Offset` 主列 + 六个元数据生成列：
+ * `Tags, Offset, sourceLevel, sourceOffset, operator, targetLevel, targetOffset, HasZOperator`。
  *
- * Tags 列写出规则：
- * - `tagsColumnIndex` 为合法非负数：把该列覆盖为 cell 当前 tags（避免回环导入时列重复）
- * - 否则（默认）：在 4 个 appended 列前**追加**一列名为 `Tags`
+ * - **Tags 列**：识别到原始 Tags 列则**覆盖**为 cell 当前 tags（避免回环导入列重复）；否则在 6 个元数据列前**追加**一列 `Tags`。
+ * - **Offset 列**：与 Tags 同策略，识别则覆盖，否则在 Tags 之后追加。
+ * - **元数据列**：`sourceOffset / targetOffset` 永远输出（候选 A）；空 offset 写 `''`。
  *
- * - 没有原始 CSV 时（如手动新增的预览框），仅输出 `Tags` + 4 列。
- * - 没有表头但有列数时，原始列以「列 0、列 1…」展示在表头。
+ * 没有原始 CSV 时（如手动新增的预览框），仅输出 `Tags, Offset, 元数据 6 列`。
  *
  * @param {ExportCsvOptions} options
  * @returns {string}
@@ -334,6 +365,10 @@ export function serializeExportCsv(options) {
     operatorOf,
     tagsOf = (item) => item?.tags ?? [],
     tagsColumnIndex = null,
+    offsetOf = (item) => item?.offsetStr ?? '',
+    offsetColumnIndex = null,
+    sourceOffsetOf = (item) => item?.sourceOffsetStr ?? '',
+    targetOffsetOf = (item) => item?.offsetStr ?? '',
     withBom = true,
     withIndex = false,
     indexStart = 1,
@@ -352,18 +387,24 @@ export function serializeExportCsv(options) {
       ? header.slice()
       : Array.from({ length: baseColCount }, (_, i) => `列 ${i}`);
 
-  const overwriteIdx =
-    Number.isInteger(tagsColumnIndex) &&
-    /** @type {number} */ (tagsColumnIndex) >= 0 &&
-    /** @type {number} */ (tagsColumnIndex) < baseColCount
-      ? /** @type {number} */ (tagsColumnIndex)
+  /** @param {number | null} idx */
+  const validIdx = (idx) =>
+    Number.isInteger(idx) &&
+    /** @type {number} */ (idx) >= 0 &&
+    /** @type {number} */ (idx) < baseColCount
+      ? /** @type {number} */ (idx)
       : null;
-  const appendTagsCol = overwriteIdx === null;
+
+  const tagsOverwriteIdx = validIdx(tagsColumnIndex);
+  const offsetOverwriteIdx = validIdx(offsetColumnIndex);
+  const appendTagsCol = tagsOverwriteIdx === null;
+  const appendOffsetCol = offsetOverwriteIdx === null;
 
   const fullHeader = [
     ...(withIndex ? [INDEX_COLUMN_NAME] : []),
     ...baseHeader,
     ...(appendTagsCol ? [TAGS_COLUMN_NAME] : []),
+    ...(appendOffsetCol ? [OFFSET_COLUMN_NAME] : []),
     ...APPENDED_EXPORT_COLUMNS,
   ];
   const lines = [fullHeader.map(escapeCsvField).join(',')];
@@ -375,17 +416,26 @@ export function serializeExportCsv(options) {
       (_, j) => (originalRow && originalRow[j] != null ? originalRow[j] : ''),
     );
     const tagsStr = joinTagsForCsv(tagsOf(item));
-    if (overwriteIdx !== null) {
-      baseCells[overwriteIdx] = tagsStr;
+    if (tagsOverwriteIdx !== null) {
+      baseCells[tagsOverwriteIdx] = tagsStr;
+    }
+    const offsetStr = String(offsetOf(item) ?? '');
+    if (offsetOverwriteIdx !== null) {
+      baseCells[offsetOverwriteIdx] = offsetStr;
     }
     const operator = operatorOf(item.operations ?? []);
     const appended = [
       item.sourceLevelStr ?? '',
+      String(sourceOffsetOf(item) ?? ''),
       operator,
       item.levelStr ?? '',
+      String(targetOffsetOf(item) ?? ''),
       item.meta?.hadZAxisOperation ? '1' : '0',
     ];
-    const middle = appendTagsCol ? [tagsStr] : [];
+    const middle = [
+      ...(appendTagsCol ? [tagsStr] : []),
+      ...(appendOffsetCol ? [offsetStr] : []),
+    ];
     const cells = withIndex
       ? [String(indexStart + i), ...baseCells, ...middle, ...appended]
       : [...baseCells, ...middle, ...appended];

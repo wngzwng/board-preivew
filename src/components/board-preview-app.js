@@ -6,10 +6,12 @@ import {
   getColumnLabelsFromRows,
   defaultContentColumnIndex,
   defaultTagsColumnIndex,
+  defaultOffsetColumnIndex,
   parseTagsCellValue,
   getMaxColumnCount,
   DEFAULT_CONTENT_COLUMN,
   DEFAULT_TAGS_COLUMN,
+  DEFAULT_OFFSET_COLUMN,
 } from '../io/csv.js';
 import { operationsToGlyphString } from '../board/operationGlyphs.js';
 import {
@@ -35,6 +37,12 @@ export class BoardPreviewApp extends HTMLElement {
      * @type {number | null}
      */
     this._csvTagsColumnIndex = null;
+    /**
+     * 导入时识别到的「Offset 所在列」索引；为 null 表示导入时没有 Offset 列，
+     * 导出时会**追加**一列 `Offset` 而不是覆盖。
+     * @type {number | null}
+     */
+    this._csvOffsetColumnIndex = null;
     /**
      * 当前 `_pendingCsv` 是否已成功被导入过：
      * 用于把「修改两个列下拉」标记为"会触发重新导入"的高风险操作。
@@ -110,6 +118,25 @@ export class BoardPreviewApp extends HTMLElement {
      */
     this._zOffset = this._loadZOffset();
     /**
+     * 全局「Offset 视觉效果」开关：true 时把每个 Cell 解析出来的柱子级 offset
+     * 反映到棋盘渲染（CSS 平移 + PNG 像素平移）。
+     *
+     * 与 Z 偏移开关**独立**且**可叠加**——
+     * 二者本质都是视觉 translate，仅作用范围不同（offset 一柱、Z 偏移按层）。
+     * @type {boolean}
+     */
+    this._offsetEnabled = this._loadOffsetEnabled();
+    /**
+     * 全局「Offset 单层增量缩放系数」（百分比整数，1–5）。
+     *
+     * 实际单层增量 = `(magnitude + 1) × offsetUnitPct%`（相对棋子宽度）。
+     * 默认 1（=protocol-level `OFFSET_UNIT × 100`），等价于"最大 6%/层"；
+     * 调到 5 时最大 30%/层，给 offset 设计更宽的视觉空间。
+     * 协议层的 `OFFSET_UNIT = 1/100` 不动——这只是**渲染端**视觉缩放。
+     * @type {number}
+     */
+    this._offsetUnitPct = this._loadOffsetUnitPct();
+    /**
      * 全局「Cell 折叠」开关：true 时所有 Cell 仅显示
      * 序号 / 棋盘 / x,y,z 范围 / 复制按钮 / 标签添加入口，
      * 隐藏其余编辑控件以让棋盘成为视觉主体。
@@ -174,6 +201,67 @@ export class BoardPreviewApp extends HTMLElement {
     } catch {
       // 隐私模式 / 配额超限时静默
     }
+  }
+
+  /**
+   * 全局 offset 视觉开关：默认开启（与"粘贴 offset 即可见效果"语义一致）。
+   * @returns {boolean}
+   */
+  _loadOffsetEnabled() {
+    try {
+      const raw = window.localStorage?.getItem(
+        BoardPreviewApp.OFFSET_ENABLED_KEY,
+      );
+      if (raw === null || raw === undefined) return true;
+      return raw === '1';
+    } catch {
+      return true;
+    }
+  }
+
+  _saveOffsetEnabled() {
+    try {
+      window.localStorage?.setItem(
+        BoardPreviewApp.OFFSET_ENABLED_KEY,
+        this._offsetEnabled ? '1' : '0',
+      );
+    } catch {
+      // 隐私模式 / 配额超限时静默
+    }
+  }
+
+  /**
+   * 全局 offset 单位缩放系数（百分比整数，1–5）；默认 1。
+   * @returns {number}
+   */
+  _loadOffsetUnitPct() {
+    try {
+      const raw = window.localStorage?.getItem(
+        BoardPreviewApp.OFFSET_UNIT_PCT_KEY,
+      );
+      const n = raw == null ? 1 : Number(raw);
+      return this._clampOffsetUnitPct(Number.isFinite(n) ? n : 1);
+    } catch {
+      return 1;
+    }
+  }
+
+  _saveOffsetUnitPct() {
+    try {
+      window.localStorage?.setItem(
+        BoardPreviewApp.OFFSET_UNIT_PCT_KEY,
+        String(this._offsetUnitPct),
+      );
+    } catch {
+      // 隐私模式 / 配额超限时静默
+    }
+  }
+
+  /** 把任意输入收敛到合法整数 [1, 5]。 */
+  _clampOffsetUnitPct(value) {
+    const n = Math.round(Number(value));
+    if (!Number.isFinite(n)) return 1;
+    return Math.max(1, Math.min(5, n));
   }
 
   /** @param {string} raw */
@@ -275,6 +363,47 @@ export class BoardPreviewApp extends HTMLElement {
   }
 
   /**
+   * 渲染「Offset 视觉效果」全局开关 + 单位缩放系数输入（与 Z 偏移开关样式一致）。
+   * 页头/sticky 双入口；开关 data-role="offset-toggle"，单位输入 data-role="offset-unit-pct"，
+   * 都通过 _syncOffsetUi 与所有同类元素双向同步。
+   * @param {'header' | 'sticky'} variant
+   */
+  _offsetToggleHtml(variant) {
+    return `
+      <span class="bp-offset-group bp-offset-group--${variant}" role="group" aria-label="Offset 视觉效果">
+        <label
+          class="bp-offset-toggle bp-offset-toggle--${variant}"
+          title="是否把每个 Cell 解析出的 offset 反映到棋盘渲染（与 Z 偏移可叠加）"
+        >
+          <input
+            type="checkbox"
+            data-role="offset-toggle"
+            ${this._offsetEnabled ? 'checked' : ''}
+          />
+          <span>Offset</span>
+        </label>
+        <label
+          class="bp-offset-unit bp-offset-unit--${variant}"
+          title="offset 单层增量缩放系数（1–5%），档位 k 对应 (k+1) × 此值 / 层"
+        >
+          <span class="bp-offset-unit__label">单位</span>
+          <input
+            type="number"
+            class="bp-offset-unit__input"
+            data-role="offset-unit-pct"
+            min="1"
+            max="5"
+            step="1"
+            value="${this._offsetUnitPct}"
+            aria-label="Offset 单位百分比（1–5）"
+          />
+          <span class="bp-offset-unit__suffix">%</span>
+        </label>
+      </span>
+    `;
+  }
+
+  /**
    * 渲染一个跳转组 HTML 片段，所有跳转入口（页头/sticky）共用。
    * @param {'header' | 'sticky'} variant
    */
@@ -308,7 +437,7 @@ export class BoardPreviewApp extends HTMLElement {
           <button type="button" class="bp-btn bp-btn--primary" data-action="add-cell">＋ 预览框</button>
         </div>
         <div class="bp-app__csv" aria-label="CSV 导入导出">
-          <span class="bp-app__csv-hint">CSV：<strong>点击按钮选择</strong>或<strong>拖拽 .csv 文件到页面</strong>导入，在下方选择关卡串所在列（默认 <code>${DEFAULT_CONTENT_COLUMN}</code>）与标签所在列（默认 <code>${DEFAULT_TAGS_COLUMN}</code>，无此列则为「无」），均不区分大小写。</span>
+          <span class="bp-app__csv-hint">CSV：<strong>点击按钮选择</strong>或<strong>拖拽 .csv 文件到页面</strong>导入；下方选择关卡串所在列（默认 <code>${DEFAULT_CONTENT_COLUMN}</code>）、标签所在列（默认 <code>${DEFAULT_TAGS_COLUMN}</code>，无此列则为「无」）、Offset 所在列（默认 <code>${DEFAULT_OFFSET_COLUMN}</code>，无此列则为「无」），列名均不区分大小写。</span>
           <div class="bp-csv-row">
             <label class="bp-csv-field bp-csv-field--check">
               <input type="checkbox" class="bp-csv-header" checked />
@@ -325,6 +454,9 @@ export class BoardPreviewApp extends HTMLElement {
             </label>
             <label class="bp-csv-field bp-csv-field--grow">标签所在列
               <select class="bp-csv-tags-select" aria-label="选择标签列（可选）"></select>
+            </label>
+            <label class="bp-csv-field bp-csv-field--grow">Offset 所在列
+              <select class="bp-csv-offset-select" aria-label="选择 Offset 列（可选）"></select>
             </label>
             <button type="button" class="bp-btn bp-btn--primary" data-action="confirm-csv-import">确认导入</button>
             <button type="button" class="bp-btn" data-action="cancel-csv-import">取消</button>
@@ -354,6 +486,7 @@ export class BoardPreviewApp extends HTMLElement {
           <span class="bp-app__jump-hint">输入序号后按 Enter 或点「跳转」，目标会尽量滚动到视口中央</span>
         </div>
         <div class="bp-app__zoffset-bar" aria-label="Z 轴偏移">
+          ${this._offsetToggleHtml('header')}
           ${this._zOffsetGroupHtml('header')}
           <span class="bp-app__zoffset-hint">每升一层 z 按棋子宽度的百分比偏移（仅渲染效果，不影响导出）。</span>
           ${this._collapseToggleHtml('header')}
@@ -421,6 +554,7 @@ export class BoardPreviewApp extends HTMLElement {
             Index 列
           </label>
           ${this._jumpGroupHtml('sticky')}
+          ${this._offsetToggleHtml('sticky')}
           ${this._zOffsetToggleHtml('sticky')}
           ${this._collapseToggleHtml('sticky')}
         </div>
@@ -469,6 +603,8 @@ export class BoardPreviewApp extends HTMLElement {
     this._initObserver();
     this._initStickyBar();
     this._applyZOffsetToRoot();
+    this._applyOffsetEnabledToRoot();
+    this._applyOffsetUnitPctToRoot();
     this._applyCellsCollapsedToRoot();
     this._syncFilterControls();
 
@@ -660,7 +796,8 @@ export class BoardPreviewApp extends HTMLElement {
       if (this._csvImported) this._warnReimport();
     } else if (
       t.classList.contains('bp-csv-column-select') ||
-      t.classList.contains('bp-csv-tags-select')
+      t.classList.contains('bp-csv-tags-select') ||
+      t.classList.contains('bp-csv-offset-select')
     ) {
       if (this._csvImported) this._warnReimport();
     } else if (role === 'tags-input') {
@@ -669,6 +806,10 @@ export class BoardPreviewApp extends HTMLElement {
       this._onZOffsetToggle(/** @type {HTMLInputElement} */ (t));
     } else if (role === 'zoffset-x' || role === 'zoffset-y') {
       this._onZOffsetNumberChange(/** @type {HTMLInputElement} */ (t));
+    } else if (role === 'offset-toggle') {
+      this._onOffsetToggle(/** @type {HTMLInputElement} */ (t));
+    } else if (role === 'offset-unit-pct') {
+      this._onOffsetUnitPctChange(/** @type {HTMLInputElement} */ (t));
     }
   }
 
@@ -681,6 +822,8 @@ export class BoardPreviewApp extends HTMLElement {
       this._syncTagsInputs(/** @type {HTMLInputElement} */ (t), { commit: false });
     } else if (role === 'zoffset-x' || role === 'zoffset-y') {
       this._onZOffsetNumberChange(/** @type {HTMLInputElement} */ (t));
+    } else if (role === 'offset-unit-pct') {
+      this._onOffsetUnitPctChange(/** @type {HTMLInputElement} */ (t));
     }
   }
 
@@ -822,6 +965,107 @@ export class BoardPreviewApp extends HTMLElement {
     }
   }
 
+  /** @param {HTMLInputElement} source */
+  _onOffsetToggle(source) {
+    const enabled = !!source.checked;
+    if (enabled === this._offsetEnabled) {
+      this._syncOffsetToggleUi();
+      return;
+    }
+    this._offsetEnabled = enabled;
+    this._saveOffsetEnabled();
+    this._applyOffsetEnabledToRoot();
+    this._syncOffsetToggleUi();
+    this._broadcastOffsetEnabled();
+  }
+
+  /**
+   * 把 offset 全局开关反映到根元素：class 与 CSS 数值开关变量。
+   *
+   * `--bp-offset-on` 在 .bp-tile 的 transform calc 中作为系数（0/1），
+   * 关闭时让 offset 项归零、不影响 Z 偏移分量。
+   */
+  _applyOffsetEnabledToRoot() {
+    const enabled = this._offsetEnabled;
+    this.classList.toggle('bp-app--offset-on', enabled);
+    this.style.setProperty('--bp-offset-on', enabled ? '1' : '0');
+  }
+
+  _syncOffsetToggleUi() {
+    const checked = this._offsetEnabled;
+    this.querySelectorAll('input[data-role="offset-toggle"]').forEach(
+      (node) => {
+        const el = /** @type {HTMLInputElement} */ (node);
+        if (el.checked !== checked) el.checked = checked;
+      },
+    );
+  }
+
+  /**
+   * 让每个 cell 知道 offset 全局开关状态——
+   * 屏幕渲染由 CSS class/变量驱动无须 JS，但 PNG 导出走 canvas，
+   * 必须在 JS 侧明知开关，故依旧广播。
+   */
+  _broadcastOffsetEnabled() {
+    for (const entry of this._entries) {
+      const cell = entry.cellEl;
+      if (cell && typeof cell.applyOffsetEnabled === 'function') {
+        cell.applyOffsetEnabled(this._offsetEnabled);
+      }
+    }
+  }
+
+  /** @param {HTMLInputElement} source */
+  _onOffsetUnitPctChange(source) {
+    const raw = Number(source.value);
+    if (!Number.isFinite(raw)) return;
+    const next = this._clampOffsetUnitPct(raw);
+    if (next === this._offsetUnitPct) {
+      // 即便值没变，也可能是用户输了越界值（如 9）被钳到 5，要回写 UI
+      this._syncOffsetUnitPctUi();
+      return;
+    }
+    this._offsetUnitPct = next;
+    this._saveOffsetUnitPct();
+    this._applyOffsetUnitPctToRoot();
+    this._syncOffsetUnitPctUi();
+    this._broadcastOffsetUnitPct();
+  }
+
+  /**
+   * 把 offset 单位缩放系数反映到根元素 CSS 变量 `--bp-offset-unit-pct`。
+   *
+   * tile 的 transform 在 main.css 中写为：
+   *   var(--bp-tile-offset-x) × var(--bp-offset-unit-pct) × 1%
+   * 故此变量变化时所有 tile 的视觉偏移**自动重排**，无需重建 DOM。
+   * PNG 导出走 canvas，单独通过 _broadcastOffsetUnitPct 同步 JS 状态。
+   */
+  _applyOffsetUnitPctToRoot() {
+    this.style.setProperty('--bp-offset-unit-pct', String(this._offsetUnitPct));
+  }
+
+  _syncOffsetUnitPctUi() {
+    const value = String(this._offsetUnitPct);
+    this.querySelectorAll('input[data-role="offset-unit-pct"]').forEach(
+      (node) => {
+        const el = /** @type {HTMLInputElement} */ (node);
+        if (document.activeElement !== el && el.value !== value) {
+          el.value = value;
+        }
+      },
+    );
+  }
+
+  /** 广播给每个 cell：PNG 渲染与 board padding 计算需要该数值。 */
+  _broadcastOffsetUnitPct() {
+    for (const entry of this._entries) {
+      const cell = entry.cellEl;
+      if (cell && typeof cell.applyOffsetUnitPct === 'function') {
+        cell.applyOffsetUnitPct(this._offsetUnitPct);
+      }
+    }
+  }
+
   /**
    * 在右下角弹出一条轻量 toast；多条并排堆叠，超过 TTL 自动消失。
    * @param {string} message 显示文案
@@ -951,6 +1195,12 @@ export class BoardPreviewApp extends HTMLElement {
     if (typeof cell.setPredefinedTags === 'function') {
       cell.setPredefinedTags(this._predefinedTags);
     }
+    if (typeof cell.applyOffsetEnabled === 'function') {
+      cell.applyOffsetEnabled(this._offsetEnabled);
+    }
+    if (typeof cell.applyOffsetUnitPct === 'function') {
+      cell.applyOffsetUnitPct(this._offsetUnitPct);
+    }
     this._entries.push({
       kind: 'manual',
       el: cell,
@@ -1036,6 +1286,12 @@ export class BoardPreviewApp extends HTMLElement {
     }
     if (typeof cell.applyBoardZOffset === 'function') {
       cell.applyBoardZOffset(this._zOffset);
+    }
+    if (typeof cell.applyOffsetEnabled === 'function') {
+      cell.applyOffsetEnabled(this._offsetEnabled);
+    }
+    if (typeof cell.applyOffsetUnitPct === 'function') {
+      cell.applyOffsetUnitPct(this._offsetUnitPct);
     }
     if (entry.originalRow) {
       cell.setOriginalCsvRow(entry.originalRow);
@@ -1532,7 +1788,7 @@ export class BoardPreviewApp extends HTMLElement {
   }
 
   /**
-   * 把所有导出共用的 serializeExportCsv 选项整理为一处，避免三个调用点遗漏 `tagsColumnIndex`。
+   * 把所有导出共用的 serializeExportCsv 选项整理为一处，避免多处调用点遗漏 `tagsColumnIndex` / `offsetColumnIndex`。
    * @param {import('../io/csv.js').ExportEntry[]} entries
    * @returns {import('../io/csv.js').ExportCsvOptions}
    */
@@ -1544,6 +1800,10 @@ export class BoardPreviewApp extends HTMLElement {
       operatorOf: operationsToGlyphString,
       tagsOf: (item) => item?.tags ?? [],
       tagsColumnIndex: this._csvTagsColumnIndex,
+      offsetOf: (item) => item?.offsetStr ?? '',
+      offsetColumnIndex: this._csvOffsetColumnIndex,
+      sourceOffsetOf: (item) => item?.sourceOffsetStr ?? '',
+      targetOffsetOf: (item) => item?.offsetStr ?? '',
       withIndex: this._csvExportWithIndex(),
     };
   }
@@ -1983,6 +2243,9 @@ export class BoardPreviewApp extends HTMLElement {
     const tagsSel = /** @type {HTMLSelectElement | null} */ (
       this.querySelector('.bp-csv-tags-select')
     );
+    const offsetSel = /** @type {HTMLSelectElement | null} */ (
+      this.querySelector('.bp-csv-offset-select')
+    );
     const headerEl = /** @type {HTMLInputElement | null} */ (
       this.querySelector('.bp-csv-header')
     );
@@ -2008,22 +2271,38 @@ export class BoardPreviewApp extends HTMLElement {
         : labels;
     sel.value = String(defaultContentColumnIndex(matchAgainst));
 
-    if (tagsSel) {
-      tagsSel.innerHTML = '';
+    /**
+     * 填充一个"可选列"下拉：第一项为「无」(value="-1")，其余为各列。
+     * @param {HTMLSelectElement | null} target
+     * @param {number} defaultIdx
+     * @param {string} noneLabel
+     */
+    const populateOptional = (target, defaultIdx, noneLabel) => {
+      if (!target) return;
+      target.innerHTML = '';
       const noneOpt = document.createElement('option');
       noneOpt.value = '-1';
-      noneOpt.textContent = '无（不导入标签）';
-      tagsSel.appendChild(noneOpt);
+      noneOpt.textContent = noneLabel;
+      target.appendChild(noneOpt);
       for (let i = 0; i < labels.length; i++) {
         const opt = document.createElement('option');
         opt.value = String(i);
         opt.textContent = `${labels[i]}（列 ${i}）`;
-        tagsSel.appendChild(opt);
+        target.appendChild(opt);
       }
-      tagsSel.disabled = labels.length === 0;
-      const tagsDefault = defaultTagsColumnIndex(matchAgainst);
-      tagsSel.value = String(tagsDefault);
-    }
+      target.disabled = labels.length === 0;
+      target.value = String(defaultIdx);
+    };
+    populateOptional(
+      tagsSel,
+      defaultTagsColumnIndex(matchAgainst),
+      '无（不导入标签）',
+    );
+    populateOptional(
+      offsetSel,
+      defaultOffsetColumnIndex(matchAgainst),
+      '无（不导入 offset）',
+    );
   }
 
   _confirmCsvImport() {
@@ -2037,6 +2316,9 @@ export class BoardPreviewApp extends HTMLElement {
     const tagsSel = /** @type {HTMLSelectElement | null} */ (
       this.querySelector('.bp-csv-tags-select')
     );
+    const offsetSel = /** @type {HTMLSelectElement | null} */ (
+      this.querySelector('.bp-csv-offset-select')
+    );
     const headerEl = /** @type {HTMLInputElement | null} */ (
       this.querySelector('.bp-csv-header')
     );
@@ -2049,20 +2331,35 @@ export class BoardPreviewApp extends HTMLElement {
       window.alert('请选择有效列。');
       return;
     }
-    const rawTagsIdx = tagsSel
-      ? Number.parseInt(tagsSel.value, 10)
-      : Number.NaN;
-    const tagsColIndex =
-      Number.isInteger(rawTagsIdx) && rawTagsIdx >= 0 ? rawTagsIdx : null;
+    /** @param {HTMLSelectElement | null} target */
+    const parseOptionalIdx = (target) => {
+      if (!target) return null;
+      const raw = Number.parseInt(target.value, 10);
+      return Number.isInteger(raw) && raw >= 0 ? raw : null;
+    };
+    const tagsColIndex = parseOptionalIdx(tagsSel);
+    const offsetColIndex = parseOptionalIdx(offsetSel);
     if (tagsColIndex !== null && tagsColIndex === colIndex) {
       window.alert('「标签所在列」不能与「关卡串所在列」相同，请重新选择。');
+      return;
+    }
+    if (offsetColIndex !== null && offsetColIndex === colIndex) {
+      window.alert('「Offset 所在列」不能与「关卡串所在列」相同，请重新选择。');
+      return;
+    }
+    if (
+      offsetColIndex !== null &&
+      tagsColIndex !== null &&
+      offsetColIndex === tagsColIndex
+    ) {
+      window.alert('「Offset 所在列」不能与「标签所在列」相同，请重新选择。');
       return;
     }
     const firstRowIsHeader = Boolean(headerEl?.checked);
     try {
       const { rows } = this._pendingCsv;
       const dataStart = firstRowIsHeader ? 1 : 0;
-      /** @type {Array<{ levelStr: string, row: string[], csvRow: number, tags: string[] }>} */
+      /** @type {Array<{ levelStr: string, row: string[], csvRow: number, tags: string[], offsetStr: string }>} */
       const picked = [];
       for (let r = dataStart; r < rows.length; r += 1) {
         const row = rows[r];
@@ -2073,7 +2370,11 @@ export class BoardPreviewApp extends HTMLElement {
           tagsColIndex !== null && row.length > tagsColIndex
             ? parseTagsCellValue(row[tagsColIndex])
             : [];
-        picked.push({ levelStr: cell, row, csvRow: r + 1, tags });
+        const offsetStr =
+          offsetColIndex !== null && row.length > offsetColIndex
+            ? String(row[offsetColIndex] ?? '').trim()
+            : '';
+        picked.push({ levelStr: cell, row, csvRow: r + 1, tags, offsetStr });
       }
       if (!picked.length) {
         window.alert('所选列中未解析到任何非空关卡串。');
@@ -2083,15 +2384,18 @@ export class BoardPreviewApp extends HTMLElement {
         firstRowIsHeader && rows.length > 0 ? [...rows[0]] : null;
       this._csvColumnCount = getMaxColumnCount(rows);
       this._csvTagsColumnIndex = tagsColIndex;
+      this._csvOffsetColumnIndex = offsetColIndex;
 
       this._resetEntries();
-      for (const { levelStr, row, csvRow, tags } of picked) {
+      for (const { levelStr, row, csvRow, tags, offsetStr } of picked) {
         this._addLazyEntry(
           {
             tags,
             sourceLevelStr: levelStr,
+            sourceOffsetStr: offsetStr,
             operations: [],
             levelStr,
+            offsetStr,
             meta: { hadZAxisOperation: false },
           },
           row,
@@ -2137,20 +2441,19 @@ export class BoardPreviewApp extends HTMLElement {
     if (panel) {
       panel.hidden = true;
     }
-    const sel = /** @type {HTMLSelectElement | null} */ (
-      this.querySelector('.bp-csv-column-select')
-    );
-    if (sel) {
-      sel.innerHTML = '';
-      sel.disabled = true;
-    }
-    const tagsSel = /** @type {HTMLSelectElement | null} */ (
-      this.querySelector('.bp-csv-tags-select')
-    );
-    if (tagsSel) {
-      tagsSel.innerHTML = '';
-      tagsSel.disabled = true;
-    }
+    /** @param {string} selector */
+    const clearSelect = (selector) => {
+      const target = /** @type {HTMLSelectElement | null} */ (
+        this.querySelector(selector)
+      );
+      if (target) {
+        target.innerHTML = '';
+        target.disabled = true;
+      }
+    };
+    clearSelect('.bp-csv-column-select');
+    clearSelect('.bp-csv-tags-select');
+    clearSelect('.bp-csv-offset-select');
     const nameEl = this.querySelector('.bp-csv-confirm__name');
     if (nameEl) {
       nameEl.textContent = '';
@@ -2160,6 +2463,8 @@ export class BoardPreviewApp extends HTMLElement {
 }
 
 BoardPreviewApp.Z_OFFSET_KEY = 'bp:z-offset:v2';
+BoardPreviewApp.OFFSET_ENABLED_KEY = 'bp:offset-enabled:v1';
+BoardPreviewApp.OFFSET_UNIT_PCT_KEY = 'bp:offset-unit-pct:v1';
 BoardPreviewApp.CELLS_COLLAPSED_KEY = 'bp:cells-collapsed:v1';
 
 customElements.define('board-preview-app', BoardPreviewApp);

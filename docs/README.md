@@ -4,7 +4,7 @@
 
 ## 产品与资源
 
-- **关卡形态**：Tile3 board；坐标与编码仍与 [编解码](components/codec.md) / `format.py` 的 `(x, y, z)` 一致，**层 `z` 对叠放与遮挡关系尤为关键**。  
+- **关卡形态**：Tile3 board；坐标与编码用 [编解码](components/codec.md) 约定的 `(row, col, z)`（对应 `format.py` 的 `(x, y, z)`），**层 `z` 对叠放与遮挡关系尤为关键**。  
 - **棋子美术**：使用 **`src/assets/`** 下的贴图等资源，**由渲染实现自行引用**（不打包进编解码逻辑）。当前示例文件包括牌底、牌面等（如 `tilebase_*.png`、`tilebase_card_*.png`）；后续新增素材直接放入 `src/assets/` 即可在文档外扩展，路径常量见 `src/assets/tileSources.js` 中的 `ASSETS_BASE`。
 
 ## 功能概览
@@ -59,7 +59,7 @@
 各模块的职责、数据流、接口约定与错误处理见 **`docs/components/`**：
 
 - [组件文档索引](components/README.md)
-- [Board 操作集](components/board-operations.md)（左右旋转 / XY 镜像 / Z 轴反转的公式、2×2 占格与锚点重整、`(z,x,y)` 后置排序、`operations` 记录与回放、`hadZAxisOperation` 单调升、CSV 四列附加）
+- [Board 操作集](components/board-operations.md)（左右旋转 / XY 镜像 / Z 轴反转的公式、2×2 占格与锚点重整、`(z, row, col)` 后置排序、`operations` 记录与回放、`hadZAxisOperation` 单调升、CSV 四列附加）
 
 ## 提案（设计记录）
 
@@ -67,6 +67,7 @@
 
 - [多标签导出](proposals/multi-tag-export.md)（OR / AND / NOT 过滤；当前实现仅支持单关键字子串匹配，**暂不实现**）
 - [标签分类与展示的体验提升](proposals/tags-ux-enhancements.md)（斜杠前缀分组、颜色哈希、折叠态计数角标、预设标签使用计数等；**暂不实现**）
+- [Board Offset](proposals/board-offset.md)（柱子级视觉偏移：`offset_str` = 4 字符组 `z+row+col+marker`，方向 × 档位双轴编码；✅ 决策已定，实施中）
 
 ## 技术栈
 

@@ -10,16 +10,16 @@
 
 ## 核心数据模型
 
-与 `RawPositionWithSuitData` 对齐的语义（字段名可按语言习惯映射，含义保持一致）：
+与 `RawPositionWithSuitData` 对齐的语义（本项目字段名 `row / col` 直接映射 `format.py` 的 `x / y`；Vita 历史命名 `y / x` 与本项目反向）：
 
 | 字段 | 含义 | 备注 |
 |------|------|------|
-| `x` | 行 | 与解析时的「行」片段对应 |
-| `y` | 列 | 与解析时的「列」片段对应 |
-| `z` | 层 | 与解析时的「层」片段对应 |
+| `row` | 行（向下递增） | 与解析时的「行」片段对应；屏幕坐标 ↓ 方向 |
+| `col` | 列（向右递增） | 与解析时的「列」片段对应；屏幕坐标 → 方向 |
+| `z` | 层 | 与解析时的「层」片段对应；越大越靠上 |
 | `suit` | 花色 | 可为空字符串；有花色时与坐标列表按顺序一一对应 |
 
-排序约定（与 `RawPositionWithSuitData.sort` 一致）：按 `(z, x, y)` 升序排列，便于与格式化器的状态机假设一致。
+排序约定（与 `RawPositionWithSuitData.sort` 一致）：按 `(z, row, col)` 升序排列，便于与格式化器的状态机假设一致。
 
 ## 关卡字符串结构（解码入口）
 
@@ -27,11 +27,11 @@
 2. 第一段为 **位置数据** `position_data`，第二段为 **花色数据** `suit_data`（可选）。
 3. **解码**（`from_level_str`）：  
    - 对 `position_data` 按「层 → 行 → 列」分隔符逐级 `split`，每层取首字符为层号，其余再分行；每行首字符为行号，其余再分列；每列片段经 `char_to_number` 得到列号。  
-   - 若存在 `suit_data`，将迭代得到的每个 `(x,y,z)` 与 `suit_data` 中**逐个字符**（当前实现为按字符 zip）组合为带花色的记录；否则花色为空。
+   - 若存在 `suit_data`，将迭代得到的每个 `(row, col, z)` 与 `suit_data` 中**逐个字符**（当前实现为按字符 zip）组合为带花色的记录；否则花色为空。
 
 ## 编码（序列化）
 
-1. **位置串**：由 `PositionDataFormatter.format` 根据列表顺序输出；遍历每条记录时依次处理 `z`（layer）、`x`（row）、`y`（column）。  
+1. **位置串**：由 `PositionDataFormatter.format` 根据列表顺序输出；遍历每条记录时依次处理 `z`（layer）、`row`、`col`。  
 2. **分隔规则**：  
    - 同一维度上坐标**与上一条相同**则该维度不再输出（省略重复）。  
    - 坐标**变化**时：若非该维度首次写入，先追加该维度的分隔符，再写入 `number_to_char(value)`。  
@@ -49,7 +49,7 @@
 | 遍历花色 | `iter_suit_from_suit_data` | 按字符迭代花色串 |
 | 解码 | `from_level_str` | `level_str` → 列表 |
 | 编码 | `to_level_str` | 列表 → `level_str` |
-| 排序 | `sort` | `(z,x,y)` 排序 |
+| 排序 | `sort` | `(z, row, col)` 排序 |
 | 仅编位置 | `PositionDataFormatter.format` | 列表 → 位置段 |
 | 仅取花色串 | `SuitDataFormatter.format` | 列表 → 花色段或空 |
 

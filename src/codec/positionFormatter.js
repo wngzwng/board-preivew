@@ -11,7 +11,12 @@ function createState() {
 
 /**
  * 等价于 `format.py` 中 `PositionDataFormatter`。
- * @param {Array<{ x: number, y: number, z: number }>} dataList
+ *
+ * 字段命名对照：本项目 `row / col` ← `format.py` 的 `x / y`。
+ * 输出顺序仍是 `layer → row → column`，与 `format.py` 一致；
+ * 状态机要求输入按 `(z, row, col)` 升序——见 `sortTiles`。
+ *
+ * @param {Array<{ row: number, col: number, z: number }>} dataList
  * @returns {string}
  */
 export function formatPositionData(dataList) {
@@ -32,8 +37,8 @@ export function formatPositionData(dataList) {
 
   for (const data of dataList) {
     processCoordinate('layer', data.z, state, separators, strList);
-    processCoordinate('row', data.x, state, separators, strList);
-    processCoordinate('column', data.y, state, separators, strList);
+    processCoordinate('row', data.row, state, separators, strList);
+    processCoordinate('column', data.col, state, separators, strList);
   }
 
   return strList.join('');

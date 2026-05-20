@@ -3,7 +3,10 @@ import { charToNumber } from './charMap.js';
 import { formatPositionData } from './positionFormatter.js';
 
 /**
- * @typedef {{ x: number, y: number, z: number, suit: string }} Tile
+ * @typedef {{ row: number, col: number, z: number, suit: string }} Tile
+ *
+ * `row` 向下递增（屏幕坐标 x↓），`col` 向右递增（屏幕坐标 y→），`z` 越大越靠上层。
+ * 命名上游对照表：本项目 `row / col` ← Python `format.py` 的 `x / y` ← Vita 历史的 `y / x`。
  */
 
 /**
@@ -39,8 +42,8 @@ export function* iterPosFromPositionData(positionData) {
       const colParts = rowData.slice(1).split(SplitChar.COLUMN);
       for (const columnData of colParts) {
         if (!columnData.length) continue;
-        const columnNum = charToNumber(columnData);
-        yield [rowNum, columnNum, layerNum];
+        const colNum = charToNumber(columnData);
+        yield [rowNum, colNum, layerNum];
       }
     }
   }
@@ -65,7 +68,7 @@ export function fromLevelStr(levelStr) {
   const { positionData, suitData } = splitPositionAndSuit(levelStr);
   const positions = [...iterPosFromPositionData(positionData)];
   if (!suitData) {
-    return positions.map(([x, y, z]) => ({ x, y, z, suit: '' }));
+    return positions.map(([row, col, z]) => ({ row, col, z, suit: '' }));
   }
   const suits = [...iterSuitFromSuitData(suitData)];
   if (suits.length !== positions.length) {
@@ -73,9 +76,9 @@ export function fromLevelStr(levelStr) {
       `花色长度(${suits.length})与牌位数量(${positions.length})不一致`,
     );
   }
-  return positions.map(([x, y, z], i) => ({
-    x,
-    y,
+  return positions.map(([row, col, z], i) => ({
+    row,
+    col,
     z,
     suit: suits[i],
   }));
@@ -96,13 +99,16 @@ export function toLevelStr(dataList) {
 }
 
 /**
+ * 与 Python `RawPositionWithSuitData.sort` 一致：按 `(z, row, col)` 升序排列。
+ * 这是 `formatPositionData` 状态机的硬性前提，几何变换完成后必须重排。
+ *
  * @param {Tile[]} dataList
  * @returns {Tile[]}
  */
 export function sortTiles(dataList) {
   return [...dataList].sort((a, b) => {
     if (a.z !== b.z) return a.z - b.z;
-    if (a.x !== b.x) return a.x - b.x;
-    return a.y - b.y;
+    if (a.row !== b.row) return a.row - b.row;
+    return a.col - b.col;
   });
 }

@@ -1,6 +1,8 @@
 # Board 操作集
 
-本页约定 **Tile3 叠层棋盘**（羊了个羊类）单个关卡在预览框内可执行的**几何变换**，对结构化数据（与 [编解码组件](codec.md) 中 `x` 行、`y` 列、`z` 层、`suit` 花色一致）的影响，以及写入导出包时 `operations` 数组的**记录格式**。
+本页约定 **Tile3 叠层棋盘**（羊了个羊类）单个关卡在预览框内可执行的**几何变换**，对结构化数据（与 [编解码组件](codec.md) 中 `row` 行、`col` 列、`z` 层、`suit` 花色一致）的影响，以及写入导出包时 `operations` 数组的**记录格式**。
+
+> **历史命名兼容**：操作 `type` 字符串 `mirror_x` / `mirror_y` 沿用历史命名（"X 轴 / Y 轴镜像"的旧称），**不**随字段重命名为 `row / col` 而改变，以兼容已存档的导出 CSV。语义上 `mirror_x` 即"关于行方向中心线对称（翻 `row`）"。
 
 实现以 [`src/board/boardOperations.js`](../../src/board/boardOperations.js) 与 [`src/board/operationGlyphs.js`](../../src/board/operationGlyphs.js) 为准，本文档与代码**逐行对应**。
 
@@ -13,14 +15,14 @@
 每块棋子是一条记录：
 
 ```ts
-type Tile = { x: number; y: number; z: number; suit: string };
+type Tile = { row: number; col: number; z: number; suit: string };
 ```
 
 | 字段 | 含义 | 说明 |
 |------|------|------|
-| `x` | 行（向下递增） | 棋子**占格左上角**的行下标 |
-| `y` | 列（向右递增） | 棋子**占格左上角**的列下标 |
-| `z` | 层（俯视叠放） | `z` 越大越靠上层；同 `z` 同 `(x,y)` 区域可能与相邻棋子重叠 |
+| `row` | 行（向下递增） | 棋子**占格左上角**的行下标；屏幕坐标 ↓ 方向 |
+| `col` | 列（向右递增） | 棋子**占格左上角**的列下标；屏幕坐标 → 方向 |
+| `z` | 层（俯视叠放） | `z` 越大越靠上层；同 `z` 同 `(row, col)` 区域可能与相邻棋子重叠 |
 | `suit` | 花色字符 | 可为空字符串；与坐标按顺序一一对应 |
 
 ### 1.1 棋子在棋盘上的占格（2×2，必读）
@@ -28,18 +30,18 @@ type Tile = { x: number; y: number; z: number; suit: string };
 - 每张牌**宽 2 格 × 高 2 格**，即占格为：
 
   ```
-  (x,   y)  (x,   y+1)
-  (x+1, y)  (x+1, y+1)
+  (row,   col)    (row,   col+1)
+  (row+1, col)    (row+1, col+1)
   ```
 
-- 数据中**只存左上角锚点** `(x, y)`，其余三格由「锚点 + 固定偏移」推导，**不在解码后改变锚点含义**。
-- 渲染层只需把 grid-item 设为 `grid-row: x..span 2 / grid-column: y..span 2`，详见 [渲染组件](render.md)。
+- 数据中**只存左上角锚点** `(row, col)`，其余三格由「锚点 + 固定偏移」推导，**不在解码后改变锚点含义**。
+- 渲染层只需把 grid-item 设为 `grid-row: row..span 2 / grid-column: col..span 2`，详见 [渲染组件](render.md)。
 
 ### 1.2 排序约定
 
-按 `(z, x, y)` 升序排列（先 `z`，同 `z` 比 `x`，同 `x` 比 `y`）；与 `format.py` 的 `RawPositionWithSuitData.sort` 一致。
+按 `(z, row, col)` 升序排列（先 `z`，同 `z` 比 `row`，同 `row` 比 `col`）；与 `format.py` 的 `RawPositionWithSuitData.sort` 一致。
 
-**这是编码侧的硬性前提**：`PositionDataFormatter` 状态机依赖单调坐标，重复或乱序会抛错。任何几何变换 **完成后** 都要重排序，详见 [3.5](#35-后置排序zxy-升序)。
+**这是编码侧的硬性前提**：`PositionDataFormatter` 状态机依赖单调坐标，重复或乱序会抛错。任何几何变换 **完成后** 都要重排序，详见 [3.5](#35-后置排序z-row-col-升序)。
 
 ---
 
@@ -53,8 +55,8 @@ type Tile = { x: number; y: number; z: number; suit: string };
 | `mirror_y` | Y 镜像 | 关于列方向（垂直）中心线对称，"左右"翻 | 否 | 否 |
 | `flip_z` | Z 反转 | `z` 取关于层范围中心的对称，**叠放顺序整体反转** | **是** | **是** |
 
-> 「视觉左/右转」按**屏幕坐标**命名：`x` 向下、`y` 向右；左转 = 视觉逆时针 90°，右转 = 视觉顺时针 90°。
-> 实现 UI 时按钮文案可用"名称"列；**导出与回放必须使用稳定的 `type` 字符串**。
+> 「视觉左/右转」按**屏幕坐标**命名：`row` 向下、`col` 向右；左转 = 视觉逆时针 90°，右转 = 视觉顺时针 90°。
+> 实现 UI 时按钮文案可用"名称"列；**导出与回放必须使用稳定的 `type` 字符串**——`mirror_x / mirror_y` 是**历史命名**，不随字段改名而变。
 
 ### 2.1 操作记录字符表（UI 紧凑显示）
 
@@ -84,10 +86,10 @@ type Tile = { x: number; y: number; z: number; suit: string };
        仅变换 tile.z
      else:
        对 2×2 的四角分别 transformGridPoint(...) 套 op 公式
-       new_x = min(row of 4 corners)
-       new_y = min(col of 4 corners)
-       tile.x, tile.y = new_x, new_y
-4. tiles.sort by (z, x, y) 升序
+       new_row = min(row of 4 corners)
+       new_col = min(col of 4 corners)
+       tile.row, tile.col = new_row, new_col
+4. tiles.sort by (z, row, col) 升序
 5. return tiles
 ```
 
@@ -97,16 +99,16 @@ type Tile = { x: number; y: number; z: number; suit: string };
 
 | 函数 | 含义 | 用途 |
 |------|------|------|
-| `getBounds(tiles)` | 仅看**锚点**的极值：`xmin = min(t.x)`、`xmax = max(t.x)`、`ymin/ymax` 同理 | **渲染**用，决定棋盘 grid 行列数（`rowCells = xmax - xmin + 2`，最后 `+2` 把 2×2 的尾巴留出来） |
-| `getFootprintCellBounds(tiles)` | 看**整个 2×2 占格的并集**：`xmin = min(t.x, t.x+1)`、`xmax = max(t.x, t.x+1)` | **几何变换**用，作为旋转/镜像/翻转公式里的 `xmin/xmax/ymin/ymax/zmin/zmax` |
+| `getBounds(tiles)` | 仅看**锚点**的极值：`rowMin = min(t.row)`、`rowMax = max(t.row)`、`colMin/colMax` 同理 | **渲染**用，决定棋盘 grid 行列数（`rowCells = rowMax - rowMin + 2`，最后 `+2` 把 2×2 的尾巴留出来） |
+| `getFootprintCellBounds(tiles)` | 看**整个 2×2 占格的并集**：`rowMin = min(t.row, t.row+1)`、`rowMax = max(t.row, t.row+1)` | **几何变换**用，作为旋转/镜像/翻转公式里的 `rowMin/rowMax/colMin/colMax/zMin/zMax` |
 
 两者本质上是同一组关键点的不同视角；几何变换必须用**占格闭区间**，否则旋转/镜像 90°后无法把"右边那 1 格"也正确翻过去。
 
 ### 3.2 为什么对 2×2 的四个格点都变换、再取 min
 
-只对锚点 `(x, y)` 套公式，结果是棋子**某一个角**的新位置；但旋转 90° 之后，原本的"左上"可能变成了"右上"或"左下"，新锚点必须仍是"占格中行/列最小的那个角"——这才是"重新规整为左上锚点"。
+只对锚点 `(row, col)` 套公式，结果是棋子**某一个角**的新位置；但旋转 90° 之后，原本的"左上"可能变成了"右上"或"左下"，新锚点必须仍是"占格中行/列最小的那个角"——这才是"重新规整为左上锚点"。
 
-实现上：对 `(x,y), (x+1,y), (x,y+1), (x+1,y+1)` 四个点都套用同一公式，再取四个结果点的 `min(row)` 与 `min(col)`：
+实现上：对 `(row,col), (row+1,col), (row,col+1), (row+1,col+1)` 四个点都套用同一公式，再取四个结果点的 `min(row)` 与 `min(col)`：
 
 ```js
 let minR = Infinity, minC = Infinity;
@@ -115,35 +117,35 @@ for (const [r, c, z] of tileCornerCells(t)) {
   minR = Math.min(minR, p.row);
   minC = Math.min(minC, p.col);
 }
-t.x = minR;
-t.y = minC;
+t.row = minR;
+t.col = minC;
 ```
 
 这样无论 op 是哪一种，新锚点都仍然是该牌 2×2 区域的"行最小、列最小角"——即左上角——保持锚点语义不变。
 
-### 3.3 公式（以单点 `(x, y)` 书写）
+### 3.3 公式（以单点 `(row, col)` 书写）
 
 | 操作 | 公式 |
 |------|------|
-| `rotate_left` | `x' = ymax - y + xmin,  y' = x - xmin + ymin,  z' = z` |
-| `rotate_right` | `x' = y - ymin + xmin,  y' = xmax - x + ymin,  z' = z` |
-| `mirror_x` | `x' = xmax + xmin - x,  y' = y,                z' = z` |
-| `mirror_y` | `x' = x,                y' = ymax + ymin - y,  z' = z` |
-| `flip_z` | `x' = x,                y' = y,                z' = zmax + zmin - z` |
+| `rotate_left` | `row' = colMax - col + rowMin,  col' = row - rowMin + colMin,  z' = z` |
+| `rotate_right` | `row' = col - colMin + rowMin,  col' = rowMax - row + colMin,  z' = z` |
+| `mirror_x` | `row' = rowMax + rowMin - row,  col' = col,                    z' = z` |
+| `mirror_y` | `row' = row,                    col' = colMax + colMin - col,  z' = z` |
+| `flip_z` | `row' = row,                    col' = col,                    z' = zMax + zMin - z` |
 
-> 公式中的 `xmin/xmax/ymin/ymax/zmin/zmax` 取自 **`getFootprintCellBounds`**（占格闭区间），而不是仅锚点的 `getBounds`。
-> 当 `xmin = ymin = 0` 时，`rotate_left` 退化为 `x' = ymax - y, y' = x`；`rotate_right` 退化为 `x' = y, y' = ymax - x`。
+> 公式中的 `rowMin/rowMax/colMin/colMax/zMin/zMax` 取自 **`getFootprintCellBounds`**（占格闭区间），而不是仅锚点的 `getBounds`。
+> 当 `rowMin = colMin = 0` 时，`rotate_left` 退化为 `row' = colMax - col, col' = row`；`rotate_right` 退化为 `row' = col, col' = rowMax - row`。
 
 ### 3.4 `flip_z` 的特殊处理
 
-`flip_z` **只动 `z`**，不动 `x, y`。代码里特判提前 `continue`，跳过"四角取 min"流程——因为对四角做 `flip_z` 得到的新四角 `(x, y, zmax+zmin-z)` 与原来 `(x, y)` 完全相同，min 也就是 `(x, y)` 本身，等价于直接改 `z`。
+`flip_z` **只动 `z`**，不动 `row, col`。代码里特判提前 `continue`，跳过"四角取 min"流程——因为对四角做 `flip_z` 得到的新四角 `(row, col, zMax+zMin-z)` 与原来 `(row, col)` 完全相同，min 也就是 `(row, col)` 本身，等价于直接改 `z`。
 
-### 3.5 后置排序（`(z, x, y)` 升序）
+### 3.5 后置排序（`(z, row, col)` 升序）
 
 每次变换都重排，是为了：
 
-1. **满足 `toLevelStr` 的单调假设**：`PositionDataFormatter` 状态机要求按 `(z, x, y)` 单调递增遍历，否则会抛 `XXX重复: N` 之类的错。
-2. **`suit` 跟随锚点同序**：tile 是 `{x, y, z, suit}` 一体的对象，sort 时 suit 自动随锚点搬动，编码时 `suit` 序列自然对齐 `(x, y, z)` 序列。
+1. **满足 `toLevelStr` 的单调假设**：`PositionDataFormatter` 状态机要求按 `(z, row, col)` 单调递增遍历，否则会抛 `XXX重复: N` 之类的错。
+2. **`suit` 跟随锚点同序**：tile 是 `{row, col, z, suit}` 一体的对象，sort 时 suit 自动随锚点搬动，编码时 `suit` 序列自然对齐 `(row, col, z)` 序列。
 
 ---
 
@@ -152,13 +154,13 @@ t.y = minC;
 实现里这些性质都自然成立，记录下来便于回归测试时构造 fixtures：
 
 - **整数性**：所有公式只做 `+/-`，整型输入 → 整型输出。
-- **范围保持**：变换后所有锚点仍在 `[xmin..xmax-1] × [ymin..ymax-1] × [zmin..zmax]` 区间（旋转会让行/列范围互换大小，但仍是同一个矩形区域）。
+- **范围保持**：变换后所有锚点仍在 `[rowMin..rowMax-1] × [colMin..colMax-1] × [zMin..zMax]` 区间（旋转会让行/列范围互换大小，但仍是同一个矩形区域）。
 - **复合性**：
   - `rotate_left ∘ rotate_left ∘ rotate_left ∘ rotate_left = id`
   - `rotate_right = rotate_left⁻¹`
   - `mirror_x ∘ mirror_x = id`，`mirror_y ∘ mirror_y = id`
   - `flip_z ∘ flip_z = id`
-- **`flip_z` 与 XY 操作交换**：`flip_z` 不动 `x,y`，XY 操作不动 `z`，二者可任意交换顺序。
+- **`flip_z` 与平面操作交换**：`flip_z` 不动 `row, col`，平面操作（旋转 / 镜像）不动 `z`，二者可任意交换顺序。
 - **`rotate_left` 与 `mirror_x`/`mirror_y` 不交换**：旋转 → 镜像 ≠ 镜像 → 旋转，回放时必须严格按 `operations` 数组顺序应用。
 
 ---
@@ -181,7 +183,7 @@ t.y = minC;
 代码见 `applyOperation(op)`：
 
 1. 若 `_tiles` 为空，提示"请先解码有效关卡"并返回。
-2. `_tiles = applyBoardOperation(_tiles, op)`，新列表已 `(z,x,y)` 排序。
+2. `_tiles = applyBoardOperation(_tiles, op)`，新列表已 `(z, row, col)` 排序。
 3. `_operations.push({ type: op, payload: {} })`——按用户点击逐条追加，不做合并。
 4. 若 `isZAxisOperation(op)` 为真（当前只有 `flip_z`），`_hadZ = true`。
 5. `levelTextarea.value = toLevelStr(_tiles)`——把新串写回输入框，便于用户复制或继续编辑。
@@ -190,11 +192,11 @@ t.y = minC;
 
 ### 5.3 `_hadZ` 的单调性
 
-只有在 `applyOperation` 中、且 `isZAxisOperation(op)` 为真时才置 `true`，**没有任何路径会把它再设回 false**——除了 5.4 的"回到原始关卡"。
+只有在 `applyOperation` 中、且 `isZAxisOperation(op)` 为真时才置 `true`，**没有任何路径会把它再设回 false**——除了 5.4 的"重置为原始关卡"。
 
 这与导出元数据 `meta.hadZAxisOperation` 的语义对齐：**只要这条关卡的编辑过程中出现过 Z 轴反转，就标记为 true**，便于下游过滤"是否含 Z 轴操作"。
 
-### 5.4 "回到原始关卡"（重置会话）
+### 5.4 "重置为原始关卡"（重置会话）
 
 按钮 `data-action="reset-level"` 触发 `_resetToOriginalLevel()`：
 
@@ -269,6 +271,32 @@ toLevelStr(
 | 未知 `op` 传给 `applyBoardOperation` | `transformGridPoint` 抛 `未知操作: {op}`，调用方应捕获并展示 |
 | 未点过"解码 / 应用"就点"回到原始关卡" | 显示提示，不动状态 |
 | CSV 导入条目尚未水合（骨架）时导出 | 用导入快照里的 `operations` / `sourceLevelStr` / `levelStr` / `hadZAxisOperation`，不重新计算 |
+
+---
+
+## 7.5 与 Offset 的同步变换
+
+每次几何操作不仅改 `_tiles`，还**同步**改柱子级 Offset 记录——否则 tile 的 `(row, col)` 锚点搬走、offset 锚点留在原地，渲染时按锚点查找直接错位失效。
+
+实现：`applyOperation(op)` 在 `applyBoardOperation(tiles, op)` **之前**先用 `getFootprintCellBounds(this._tiles)` 拿到 bounds（两侧变换共用同一份 bounds，保证一致），再调用 [`applyBoardOperationToOffsets(records, op, bounds)`](../../src/board/offsetOperations.js) 同步变换 OffsetRecord 列表，最后把序列化后的新 `offset_str` 回写到 textarea。
+
+变换规则简表（详细推导见 `offsetOperations.js` 的 JSDoc）：
+
+| 字段 | 平面操作（rotate / mirror） | `flip_z` |
+| --- | --- | --- |
+| `(row, col)` | 与 tile 同公式（2×2 占格四角变换取 min） | 不变 |
+| `direction` | 单位向量按同公式旋转/镜像后查表 | **反向**（保证视觉等价） |
+| `magnitude` | 不变 | 不变 |
+| `z` | 不变 | `zMin + zMax - z`（与 tile.z 同公式） |
+
+`flip_z` 反向 + 翻 z 是 [docs/proposals/board-offset.md §10.4](../proposals/board-offset.md#104-渲染组件) 渲染公式 `(t.z - offRec.z) × dirVec × step` 在 z 反演下的视觉等价解。
+
+不变量（与 §4 平面操作复合性匹配，并已落到 `test/offsetOperations.test.js`）：
+- `rotate_left ∘ rotate_left ∘ rotate_left ∘ rotate_left = id`
+- `mirror_x ∘ mirror_x = id`，`mirror_y ∘ mirror_y = id`
+- `flip_z ∘ flip_z = id`
+- `rotate_right = rotate_left⁻¹`
+- 旋转 / 镜像与 `flip_z` 交换；旋转与镜像**不**交换
 
 ---
 
