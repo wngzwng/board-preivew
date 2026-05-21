@@ -3,7 +3,7 @@
  * 导入：支持按列索引提取；表头可由 UI 读取后供用户选择列（默认 `Content`）。
  */
 
-import { readTextFileUtf8 } from './bundle.js';
+import { readTextFileUtf8, streamTextFileUtf8 } from './bundle.js';
 
 /** 默认关卡串所在列表头名（不区分大小写） */
 export const DEFAULT_CONTENT_COLUMN = 'Content';
@@ -198,6 +198,137 @@ export function parseCsv(text) {
 }
 
 /**
+ * 流式 CSV 解析器：把任意大小的文本按 chunk 喂入，每解析出一行就回调一次。
+ *
+ * 与 {@link parseCsv} 严格同语义：
+ * - `"..."` 包围 + `""` 转义；
+ * - `\n` / `\r` / `\r\n` 任一作为行终止；
+ * - 整行全空白（含纯空字段）的行被丢弃，行长度 ≥ 2 的全空行保留为占位。
+ *
+ * 设计目的是处理"浏览器 readAsText 跑不动的大文件"（数百 MB ~ GB）。
+ * 调用方负责把 `File.stream() / TextDecoderStream` 的 chunk 序列喂给 `feed`，
+ * 最后调一次 `end`。
+ *
+ * **跨 chunk 边界的两个易错点**已处理：
+ * 1. `""` 转义可能被切到两个 chunk 中——若 chunk 末尾正好是引号内的 `"`，
+ *    暂存到 carry，下次 feed 时拼回开头再判断。
+ * 2. `\r\n` 也可能跨边界——若 chunk 末尾是 `\r`（且不在引号内），暂记
+ *    "刚 flush 过"，下一 chunk 首字符若为 `\n` 则跳过；这与 parseCsv 内
+ *    `if (text[i + 1] === '\n') i++` 一致。
+ *
+ * @param {(row: string[]) => void} onRow 每完成一行就回调一次（同步）
+ * @returns {{ feed: (chunk: string) => void, end: () => void }}
+ */
+export function createCsvStreamParser(onRow) {
+  let row = [];
+  let field = '';
+  let inQuotes = false;
+  /** 上一个 feed 末尾留下的"引号内单 `"`"，等下次首字符联合判断转义 */
+  let carryQuote = false;
+  /** 上一个 feed 以 `\r` 结尾（且已 flushRow）：下次 feed 首字符若 `\n` 应跳过 */
+  let pendingLfSkip = false;
+  let bomChecked = false;
+
+  const flushRow = () => {
+    row.push(field);
+    field = '';
+    const nonEmpty = row.some((c) => String(c).trim() !== '');
+    if (nonEmpty || row.length > 1) {
+      onRow(row);
+    }
+    row = [];
+  };
+
+  /** 处理一个非控制状态下的字符（不在 inQuotes 内）。 */
+  const handleUnquoted = (c, next) => {
+    if (c === '"') {
+      inQuotes = true;
+      return 0;
+    }
+    if (c === ',') {
+      row.push(field);
+      field = '';
+      return 0;
+    }
+    if (c === '\n') {
+      flushRow();
+      return 0;
+    }
+    if (c === '\r') {
+      flushRow();
+      if (next === '\n') return 1; // 同 chunk 内可立即跳过下一个字符
+      pendingLfSkip = true; // 跨 chunk 时延迟到下一次 feed
+      return 0;
+    }
+    field += c;
+    return 0;
+  };
+
+  return {
+    feed(chunk) {
+      if (!chunk) return;
+      if (!bomChecked) {
+        bomChecked = true;
+        if (chunk.charCodeAt(0) === 0xfeff) chunk = chunk.slice(1);
+      }
+      let i = 0;
+      // 上次 feed 切在引号转义中间：用本次首字符决定是转义 `"` 还是闭合引号
+      if (carryQuote) {
+        carryQuote = false;
+        if (chunk[0] === '"') {
+          field += '"';
+          i = 1;
+        } else {
+          inQuotes = false;
+        }
+      }
+      // 上次 feed 末尾是 `\r`：若本次首字符是 `\n` 则跳过，避免 `\r\n` 产生空行
+      if (pendingLfSkip) {
+        pendingLfSkip = false;
+        if (chunk[i] === '\n') i++;
+      }
+      const len = chunk.length;
+      while (i < len) {
+        const c = chunk[i];
+        if (inQuotes) {
+          if (c === '"') {
+            if (i + 1 < len) {
+              if (chunk[i + 1] === '"') {
+                field += '"';
+                i += 2;
+                continue;
+              }
+              inQuotes = false;
+              i++;
+              continue;
+            }
+            // 末尾的 `"`，单独决策推迟到下一次 feed
+            carryQuote = true;
+            return;
+          }
+          field += c;
+          i++;
+          continue;
+        }
+        const skip = handleUnquoted(c, i + 1 < len ? chunk[i + 1] : null);
+        i += 1 + skip;
+      }
+    },
+    end() {
+      // 文件结尾的善后：carryQuote 若还在 = 单独的闭合 `"`；pendingLfSkip 直接忽略
+      if (carryQuote) {
+        carryQuote = false;
+        inQuotes = false;
+      }
+      // 如果还有数据在 field/row 中（最后一行没有换行符），补 flush 一次。
+      if (field.length > 0 || row.length > 0) {
+        flushRow();
+      }
+    },
+  };
+}
+
+/**
  * @typedef {{ kind: 'index', index: number, skipHeaderRow: boolean }} ColumnSpecIndex
  * @typedef {{ kind: 'header', name: string }} ColumnSpecHeader
  * @typedef {ColumnSpecIndex | ColumnSpecHeader} ColumnSpec
@@ -285,6 +416,92 @@ export function extractLevelStringsFromCsvText(text, spec) {
 export async function readLevelStringsFromCsvFile(file, spec) {
   const text = await readTextFileUtf8(file);
   return extractLevelStringsFromCsvText(text, spec);
+}
+
+/**
+ * 流式扫描一个 CSV 文件，每解析出一行就回调一次 `onRow`。
+ *
+ * 为什么不直接 `readTextFileUtf8 + parseCsv`：超过 ~100 MB 的文件在浏览器中
+ * 一次性 `FileReader.readAsText` 容易 OOM 或静默返回空字符串，导致用户看到的
+ * "CSV 为空或无法解析"的假阳性错误。流式路径把"分块解码 + 增量解析"绑在
+ * 同一条链路上，内存峰值只取决于 chunk 大小与回调里持有的状态。
+ *
+ * 回调返回 `false` 可以提前终止解析（例如只想读首行）。回调里抛出的异常会被
+ * 透传出去，作为整个 Promise 的拒绝原因。
+ *
+ * @param {File} file
+ * @param {(row: string[], rowIndex: number) => boolean | void} onRow
+ *        `rowIndex` 从 0 开始；返回 `false` 终止。
+ * @param {{
+ *   onProgress?: (loaded: number, total: number) => void,
+ *   signal?: AbortSignal,
+ * }} [options]
+ */
+export async function streamParseCsvFile(file, onRow, options = {}) {
+  const ac = new AbortController();
+  const externalSignal = options.signal;
+  if (externalSignal) {
+    if (externalSignal.aborted) {
+      ac.abort();
+    } else {
+      externalSignal.addEventListener('abort', () => ac.abort(), {
+        once: true,
+      });
+    }
+  }
+  let rowIndex = 0;
+  /** @type {unknown} */
+  let pendingError = null;
+  const parser = createCsvStreamParser((row) => {
+    if (pendingError !== null || ac.signal.aborted) return;
+    let r;
+    try {
+      r = onRow(row, rowIndex);
+    } catch (e) {
+      pendingError = e;
+      ac.abort();
+      rowIndex += 1;
+      return;
+    }
+    rowIndex += 1;
+    if (r === false) ac.abort();
+  });
+  try {
+    await streamTextFileUtf8(
+      file,
+      (chunk) => {
+        if (ac.signal.aborted) return;
+        parser.feed(chunk);
+      },
+      { onProgress: options.onProgress, signal: ac.signal },
+    );
+  } catch (e) {
+    // 我们自己 abort 的视为正常停止；外部 signal abort 时也走这里。
+    if (!(e instanceof Error) || e.name !== 'AbortError') {
+      if (pendingError !== null) throw pendingError;
+      throw e;
+    }
+  }
+  parser.end();
+  if (pendingError !== null) throw pendingError;
+}
+
+/**
+ * 流式读取 CSV 的第一行（用于列选择面板的列名提示），不缓存其余内容。
+ *
+ * @param {File} file
+ * @returns {Promise<string[]>}
+ */
+export async function readCsvFirstRow(file) {
+  /** @type {string[] | null} */
+  let firstRow = null;
+  await streamParseCsvFile(file, (row) => {
+    if (firstRow === null) {
+      firstRow = row;
+      return false;
+    }
+  });
+  return firstRow ?? [];
 }
 
 /** @param {string} s */

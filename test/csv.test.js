@@ -13,6 +13,7 @@ import {
   defaultContentColumnIndex,
   defaultTagsColumnIndex,
   defaultOffsetColumnIndex,
+  createCsvStreamParser,
 } from '../src/io/csv.js';
 import { operationsToGlyphString } from '../src/board/operationGlyphs.js';
 
@@ -282,4 +283,83 @@ test('getColumnLabelsFromRows: 表头与无表头', () => {
   const rows = parseCsv('A,B,C\n1,2,3');
   assert.deepEqual(getColumnLabelsFromRows(rows, true), ['A', 'B', 'C']);
   assert.deepEqual(getColumnLabelsFromRows(rows, false), ['列 0', '列 1', '列 2']);
+});
+
+/**
+ * 把整段文本切成若干 chunk 后喂给流式解析器，把所有 onRow 收到的行收集起来。
+ *
+ * @param {string} text
+ * @param {number[]} cutPoints 每个元素为 chunk 长度；最后一段为剩余全部
+ */
+function streamParseAll(text, cutPoints = []) {
+  /** @type {string[][]} */
+  const rows = [];
+  const p = createCsvStreamParser((row) => rows.push(row));
+  if (!cutPoints.length) {
+    p.feed(text);
+    p.end();
+    return rows;
+  }
+  let off = 0;
+  for (const len of cutPoints) {
+    p.feed(text.slice(off, off + len));
+    off += len;
+  }
+  if (off < text.length) p.feed(text.slice(off));
+  p.end();
+  return rows;
+}
+
+test('createCsvStreamParser: 单 chunk 与 parseCsv 同语义', () => {
+  const cases = [
+    'a,b\n1,2',
+    '"a,b",c\nx,y',
+    'a,b\n1,"He said ""hi"""\n',
+    'a\r\nb\r\n', // \r\n
+    '\n', // 只一个换行：空行被丢弃
+    'last-without-newline', // 末尾无换行
+    'h1,h2\nv1,"line1\nline2"\nv3,v4', // 字段内含换行
+    '', // 空文本
+  ];
+  for (const csv of cases) {
+    const expected = parseCsv(csv);
+    const got = streamParseAll(csv);
+    assert.deepEqual(got, expected, `mismatch for ${JSON.stringify(csv)}`);
+  }
+});
+
+test('createCsvStreamParser: 多 chunk 切割不影响结果（包括引号转义、\\r\\n 边界）', () => {
+  const csv = 'a,b\n"x,y","p""q"\r\nlast,one';
+  const expected = parseCsv(csv);
+  // 暴力枚举所有 1/2 字符切割位置，确保跨边界状态保持正确
+  for (let i = 0; i < csv.length; i++) {
+    const got = streamParseAll(csv, [i, 1]);
+    assert.deepEqual(
+      got,
+      expected,
+      `chunk split at ${i} produced wrong rows`,
+    );
+  }
+});
+
+test('createCsvStreamParser: BOM 自动剥离', () => {
+  const csv = '\uFEFFa,b\n1,2';
+  assert.deepEqual(streamParseAll(csv), [
+    ['a', 'b'],
+    ['1', '2'],
+  ]);
+});
+
+test('createCsvStreamParser: 跨 chunk 的 \\r\\n 不产生空行', () => {
+  // \r 与 \n 被切到不同 chunk
+  const got = streamParseAll('a\r\nb', [2, 1]); // ['a\r', '\n', 'b']
+  assert.deepEqual(got, [['a'], ['b']]);
+});
+
+test('createCsvStreamParser: 跨 chunk 的 "" 转义保持引号内', () => {
+  // 引号内的 "" 转义被切到不同 chunk
+  const csv = '"a""b",c';
+  // 在第 2 个字符切：chunk1='"a', chunk2='"', chunk3='"b",c'
+  const got = streamParseAll(csv, [2, 1]);
+  assert.deepEqual(got, [['a"b', 'c']]);
 });

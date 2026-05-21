@@ -107,6 +107,14 @@ board-preview-app {
   color: var(--bp-accent);
 }
 
+.bp-csv-confirm__progress {
+  flex: 1 1 100%;
+  margin-top: 0.25rem;
+  font-size: 0.8rem;
+  color: var(--bp-muted, #94a3b8);
+  font-variant-numeric: tabular-nums;
+}
+
 .bp-csv-field--grow {
   flex: 1 1 200px;
 }
@@ -486,6 +494,14 @@ board-preview-app {
   );
   border: 1px dashed var(--bp-border);
   border-radius: 12px;
+  /*
+   * 十万级 skeleton 渲染优化：浏览器跳过视口外节点的 layout / paint。
+   * 给一个 intrinsic-size 让滚动条尺寸稳定，不会因为元素被"省略渲染"
+   * 而前后晃动。需要现代 Chromium / Safari 17+；老浏览器忽略这两个属性
+   * 不会影响功能，只是回退到全量布局。
+   */
+  content-visibility: auto;
+  contain-intrinsic-size: auto 360px;
 }
 
 .bp-cell-skeleton__seq {

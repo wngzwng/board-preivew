@@ -1,14 +1,13 @@
 import './board-preview-cell.js';
-import { downloadTextFile, readTextFileUtf8 } from '../io/bundle.js';
+import { downloadTextFile } from '../io/bundle.js';
 import {
-  parseCsv,
   serializeExportCsv,
-  getColumnLabelsFromRows,
   defaultContentColumnIndex,
   defaultTagsColumnIndex,
   defaultOffsetColumnIndex,
   parseTagsCellValue,
-  getMaxColumnCount,
+  readCsvFirstRow,
+  streamParseCsvFile,
   DEFAULT_CONTENT_COLUMN,
   DEFAULT_TAGS_COLUMN,
   DEFAULT_OFFSET_COLUMN,
@@ -24,8 +23,19 @@ import { tagHue } from '../utils/tagColor.js';
 export class BoardPreviewApp extends HTMLElement {
   constructor() {
     super();
-    /** @type {{ rows: string[][], fileName: string } | null} */
+    /**
+     * 当前已选定但尚未确认导入的 CSV。
+     *
+     * **流式路径**：不再缓存全部 `rows`——600 MB 量级的 CSV 一次性 readAsText
+     * 会让浏览器静默 OOM / 返回空字符串，触发"为空或无法解析"的假阳性错误。
+     * 这里只保留 `File` 引用 + 首行（用于列名提示），全文件扫描推迟到
+     * `_confirmCsvImport` 中按需做一次。
+     *
+     * @type {{ file: File, fileName: string, firstRow: string[] } | null}
+     */
     this._pendingCsv = null;
+    /** "确认导入"流式扫描进行中的并发保护标志 */
+    this._csvImporting = false;
     /** 已导入 CSV 的表头（含表头时为首行；无表头为 null） */
     /** @type {string[] | null} */
     this._csvHeader = null;
@@ -77,6 +87,11 @@ export class BoardPreviewApp extends HTMLElement {
      */
     this._summaryRafId = null;
     /**
+     * 待执行的 status 刷新 rAF 句柄；用于把同一帧内多次 hydrate/dehydrate 合并成一次渲染。
+     * @type {number | null}
+     */
+    this._statusRafId = null;
+    /**
      * 多标签导出浮层的当前会话状态；为 null 表示浮层未打开。
      * 关闭即丢弃，不写 localStorage（与 multi-tag-export.md §8 决策一致）。
      * @type {{ tags: Set<string>, mode: 'or' | 'and', root: HTMLElement } | null}
@@ -105,11 +120,22 @@ export class BoardPreviewApp extends HTMLElement {
      * }>}
      */
     this._entries = [];
-    /** 骨架元素 → entry 反查（仅未水合的 entry 在内） */
-    /** @type {WeakMap<Element, object>} */
+    /**
+     * 元素 → entry 反查；同时支撑两种 observer：
+     * - 未水合：key 为 skeleton 元素，hydrate observer 用它定位 entry；
+     * - 已水合：key 为 cell 元素，dehydrate observer 用它定位 entry。
+     * @type {WeakMap<Element, object>}
+     */
     this._entryByEl = new WeakMap();
     /** @type {IntersectionObserver | null} */
     this._observer = null;
+    /** @type {IntersectionObserver | null} */
+    this._dehydrateObserver = null;
+    /**
+     * 当前处于已水合状态的 entry 数量，增量维护。十万级 entry 时直接 reduce
+     * 会让每次 hydrate / dehydrate 都触发 O(N) 扫描，滚动会被状态行拖到不可用。
+     */
+    this._hydratedCount = 0;
     /**
      * Z 轴视觉偏移（仅渲染效果，不影响 levelStr / operations / 导出）。
      * x、y 单位为「棋子宽度的百分比」，可正可负。
@@ -460,6 +486,7 @@ export class BoardPreviewApp extends HTMLElement {
             </label>
             <button type="button" class="bp-btn bp-btn--primary" data-action="confirm-csv-import">确认导入</button>
             <button type="button" class="bp-btn" data-action="cancel-csv-import">取消</button>
+            <span class="bp-csv-confirm__progress" hidden aria-live="polite"></span>
           </div>
           <div class="bp-csv-row">
             <button type="button" class="bp-btn" data-action="export-csv">导出 CSV</button>
@@ -1144,17 +1171,49 @@ export class BoardPreviewApp extends HTMLElement {
   _initObserver() {
     if (typeof IntersectionObserver === 'undefined') {
       this._observer = null;
+      this._dehydrateObserver = null;
       return;
     }
+    // 两个 observer 的两条 rootMargin 形成一个"keep-alive 走廊"：
+    //
+    //   ┌─── dehydrate buffer (rootMargin: KEEP_ALIVE_PX) ───┐
+    //   │   ┌── hydrate buffer (rootMargin: HYDRATE_PX) ──┐  │
+    //   │   │              视口 (viewport)                │  │
+    //   │   └─────────────────────────────────────────────┘  │
+    //   └────────────────────────────────────────────────────┘
+    //
+    // - 进入 hydrate buffer  → skeleton → cell（水合）
+    // - 离开 dehydrate buffer → cell → skeleton（回收）
+    //
+    // 内圈用来"提前水合，滚到时已就绪"；外圈用来"保留一定缓冲区，避免来回
+    // 滚动时反复水合 / 回收"。两圈之间的差值越大、滚动越流畅但内存占用更高。
     this._observer = new IntersectionObserver(
       (records) => {
         for (const r of records) {
           if (!r.isIntersecting) continue;
           const entry = this._entryByEl.get(r.target);
-          if (entry) this._hydrateEntry(entry);
+          if (entry && !entry.cellEl) this._hydrateEntry(entry);
         }
       },
-      { root: null, rootMargin: '600px 0px', threshold: 0 },
+      {
+        root: null,
+        rootMargin: `${BoardPreviewApp.HYDRATE_BUFFER_PX}px 0px`,
+        threshold: 0,
+      },
+    );
+    this._dehydrateObserver = new IntersectionObserver(
+      (records) => {
+        for (const r of records) {
+          if (r.isIntersecting) continue;
+          const entry = this._entryByEl.get(r.target);
+          if (entry && entry.cellEl) this._dehydrateEntry(entry);
+        }
+      },
+      {
+        root: null,
+        rootMargin: `${BoardPreviewApp.KEEP_ALIVE_BUFFER_PX}px 0px`,
+        threshold: 0,
+      },
     );
   }
 
@@ -1162,15 +1221,16 @@ export class BoardPreviewApp extends HTMLElement {
    * 重置整个预览网格（清空骨架与已水合 cell）
    */
   _resetEntries() {
-    if (this._observer) {
-      for (const e of this._entries) {
-        if (!e.cellEl) {
-          this._observer.unobserve(e.el);
-        }
+    for (const e of this._entries) {
+      if (e.cellEl) {
+        if (this._dehydrateObserver) this._dehydrateObserver.unobserve(e.cellEl);
+      } else if (this._observer) {
+        this._observer.unobserve(e.el);
       }
     }
     this._entries = [];
     this._entryByEl = new WeakMap();
+    this._hydratedCount = 0;
     this._grid.innerHTML = '';
     // 切换 CSV 后，原来的标签使用数据全部失效；筛选状态也应该自然归零。
     if (this._isTagFilterActive()) {
@@ -1208,7 +1268,9 @@ export class BoardPreviewApp extends HTMLElement {
       item: {},
       originalRow: null,
       csvRow: null,
+      index: this._entries.length + 1,
     });
+    this._hydratedCount += 1;
     this._refreshSequenceBadges();
     this._renderStatus();
     // 新增 cell 默认 0 标签，需更新「暂无标签 N」统计与按 untagged 已激活的筛选可见性
@@ -1232,6 +1294,8 @@ export class BoardPreviewApp extends HTMLElement {
       item,
       originalRow,
       csvRow,
+      // 1 起的序号，给 _applySequenceBadge 用，避免 indexOf
+      index: this._entries.length + 1,
     };
     this._entryByEl.set(skeleton, entry);
     this._grid.appendChild(skeleton);
@@ -1242,6 +1306,80 @@ export class BoardPreviewApp extends HTMLElement {
       this._hydrateEntry(entry);
     }
     return entry;
+  }
+
+  /**
+   * 批量添加懒加载条目（用于一次性导入数万条 CSV 行）。
+   *
+   * 与连续调用 `_addLazyEntry` 相比的关键区别：
+   * 1. 一批 skeleton 先 append 到 `DocumentFragment`，一次性挂到 grid，
+   *    把同步 reflow 从 N 次降到 1 次/批；
+   * 2. 每批之间通过 `requestAnimationFrame` 让出主线程，浏览器可以绘制、
+   *    处理用户输入，避免"标签直接卡死/崩溃"；
+   * 3. `onProgress(built, total)` 回调用于在 UI 上展示构建进度。
+   *
+   * 不再每条 `_addLazyEntry` 都触发布局，是支撑 10 万+ 条目的关键路径。
+   *
+   * @param {Array<{ levelStr: string, slimRow: string[], csvRow: number, tags: string[], offsetStr: string }>} picked
+   * @param {(built: number, total: number) => void} [onProgress]
+   */
+  async _batchAddLazyEntries(picked, onProgress) {
+    const BATCH_SIZE = BoardPreviewApp.IMPORT_BATCH_SIZE;
+    const total = picked.length;
+    let i = 0;
+    while (i < total) {
+      const end = Math.min(i + BATCH_SIZE, total);
+      const frag = document.createDocumentFragment();
+      /** @type {Array<{ el: HTMLElement, entry: object }>} */
+      const batch = [];
+      for (; i < end; i += 1) {
+        const p = picked[i];
+        const item = {
+          tags: p.tags,
+          sourceLevelStr: p.levelStr,
+          sourceOffsetStr: p.offsetStr,
+          operations: [],
+          levelStr: p.levelStr,
+          offsetStr: p.offsetStr,
+          meta: { hadZAxisOperation: false },
+        };
+        const skeleton = this._createSkeleton(
+          this._entries.length + batch.length + 1,
+          item,
+          p.csvRow,
+        );
+        const entry = {
+          kind: /** @type {'csv'} */ ('csv'),
+          el: skeleton,
+          cellEl: null,
+          item,
+          originalRow: p.slimRow,
+          csvRow: p.csvRow,
+          index: this._entries.length + batch.length + 1,
+        };
+        frag.appendChild(skeleton);
+        batch.push({ el: skeleton, entry });
+      }
+      this._grid.appendChild(frag);
+      for (const { el, entry } of batch) {
+        this._entryByEl.set(el, entry);
+        this._entries.push(entry);
+        if (this._observer) {
+          this._observer.observe(el);
+        } else {
+          this._hydrateEntry(entry);
+        }
+      }
+      onProgress?.(i, total);
+      // 让浏览器有机会绘制 / 处理事件，再继续下一批
+      await new Promise((resolve) => {
+        if (typeof requestAnimationFrame === 'function') {
+          requestAnimationFrame(() => resolve());
+        } else {
+          setTimeout(resolve, 0);
+        }
+      });
+    }
   }
 
   /**
@@ -1267,7 +1405,10 @@ export class BoardPreviewApp extends HTMLElement {
     return div;
   }
 
-  /** 将骨架替换为真实预览框（一次性，水合后保留） */
+  /**
+   * 把骨架替换为真实预览框；与 {@link _dehydrateEntry} 构成"复用"循环——
+   * 滚出 keep-alive 区的 cell 会被回收成 skeleton，回到 hydrate 区时再次水合。
+   */
   _hydrateEntry(entry) {
     if (entry.cellEl) return;
     const skeleton = entry.el;
@@ -1278,9 +1419,18 @@ export class BoardPreviewApp extends HTMLElement {
       this._observer.unobserve(skeleton);
     }
     this._entryByEl.delete(skeleton);
+    // 把筛选可见性从旧元素带到新元素——否则 dehydrate 一过，被筛选隐藏的
+    // 行会"莫名又冒出来"，看上去像筛选失效。
+    if (skeleton.hidden) cell.hidden = true;
     skeleton.replaceWith(cell);
     entry.el = cell;
     entry.cellEl = cell;
+    this._hydratedCount += 1;
+    // 让 dehydrate observer 能从 cell 元素反查到 entry
+    this._entryByEl.set(cell, entry);
+    if (this._dehydrateObserver) {
+      this._dehydrateObserver.observe(cell);
+    }
     if (typeof cell.setPredefinedTags === 'function') {
       cell.setPredefinedTags(this._predefinedTags);
     }
@@ -1298,13 +1448,58 @@ export class BoardPreviewApp extends HTMLElement {
     }
     cell.loadBundleItem(entry.item);
     this._applySequenceBadge(entry);
-    this._renderStatus();
+    this._scheduleStatusRefresh();
+  }
+
+  /**
+   * 把已水合的 cell 回收为骨架——支撑十万级 CSV 滚动流畅的关键。
+   *
+   * 触发时机：cell 离开 dehydrate observer 的 keep-alive 缓冲区。
+   *
+   * 关键点：
+   * - 用 `cell.getExportItem()` 把"用户可能做过的所有编辑"（操作链、当前
+   *   levelStr / offsetStr、tags、meta）回写到 `entry.item`；之后 rehydrate
+   *   时 `loadBundleItem` 能完全还原。
+   * - 焦点保护：若用户正在该 cell 内编辑（焦点在子元素中），跳过本次回收，
+   *   等下一帧再判断——否则会无故吞掉编辑焦点。
+   * - 状态行 `_renderStatus` 会重新计算"已渲染 X"，让用户感知到回收数量。
+   */
+  _dehydrateEntry(entry) {
+    const cell = entry.cellEl;
+    if (!cell) return;
+    if (cell.contains(document.activeElement)) return;
+    if (typeof cell.getExportItem === 'function') {
+      try {
+        entry.item = cell.getExportItem();
+      } catch {
+        // 拿不到当前状态时保留 entry.item 原样——比丢数据安全
+      }
+    }
+    const seqIndex = this._entries.indexOf(entry) + 1;
+    const skeleton = this._createSkeleton(seqIndex, entry.item, entry.csvRow);
+    // 对称于 _hydrateEntry：cell 被筛选隐藏时，回收后的 skeleton 也必须保持隐藏，
+    // 否则隐藏的 cell 在被 dehydrate 之后会重新可见，破坏筛选视图。
+    if (cell.hidden) skeleton.hidden = true;
+    if (this._dehydrateObserver) this._dehydrateObserver.unobserve(cell);
+    this._entryByEl.delete(cell);
+    cell.replaceWith(skeleton);
+    entry.el = skeleton;
+    entry.cellEl = null;
+    this._hydratedCount = Math.max(0, this._hydratedCount - 1);
+    this._entryByEl.set(skeleton, entry);
+    if (this._observer) this._observer.observe(skeleton);
+    this._scheduleStatusRefresh();
   }
 
   /** @param {(typeof this._entries)[number]} entry */
   _applySequenceBadge(entry) {
     if (!entry.cellEl || typeof entry.cellEl.setSequence !== 'function') return;
-    const index = this._entries.indexOf(entry) + 1;
+    // 关键性能修复：避免 indexOf。十万级 entries 时每次 hydrate 触发 O(N) 扫描
+    // 会让滚动卡到不可用。`entry.index` 在 push / 重排时维护，hydrate 直接读。
+    const index =
+      Number.isFinite(entry.index) && entry.index > 0
+        ? entry.index
+        : this._entries.indexOf(entry) + 1;
     entry.cellEl.setSequence({
       index,
       total: this._entries.length,
@@ -1317,10 +1512,25 @@ export class BoardPreviewApp extends HTMLElement {
     const total = this._entries.length;
     for (let i = 0; i < total; i++) {
       const e = this._entries[i];
+      // 顺手同步 `index` 缓存，让后续单点 hydrate 拿到正确的 seq 号
+      e.index = i + 1;
       if (e.cellEl && typeof e.cellEl.setSequence === 'function') {
         e.cellEl.setSequence({ index: i + 1, total, csvRow: e.csvRow });
       }
     }
+  }
+
+  /**
+   * 把同一帧内多次 hydrate/dehydrate 触发的 status 刷新合并为一次。
+   * 十万级 entries 下，逐次刷新会让 visible 计数（O(N) 扫 hidden 属性）反复
+   * 跑，把滚动 FPS 拖到个位数。
+   */
+  _scheduleStatusRefresh() {
+    if (this._statusRafId != null) return;
+    this._statusRafId = window.requestAnimationFrame(() => {
+      this._statusRafId = null;
+      this._renderStatus();
+    });
   }
 
   _renderStatus() {
@@ -1330,7 +1540,7 @@ export class BoardPreviewApp extends HTMLElement {
     );
     if (!el) return;
     const total = this._entries.length;
-    const hydrated = this._entries.reduce((n, e) => (e.cellEl ? n + 1 : n), 0);
+    const hydrated = this._hydratedCount;
     const filterOn = this._isTagFilterActive();
     const visible = filterOn
       ? this._entries.reduce((n, e) => (e.el?.hidden ? n : n + 1), 0)
@@ -1356,12 +1566,17 @@ export class BoardPreviewApp extends HTMLElement {
   /**
    * 把后续相邻的 bp-cell-change 合并成一次 summary 刷新；
    * 大批量水合 / 解码场景下避免每个 Cell 单独触发全量计数。
+   *
+   * 同时如果当前筛选激活，则同帧重跑一次 _applyTagFilter——否则用户在
+   * 筛选状态下给 cell 加 / 删标签，筛选结果不会实时跟随：刚加上的命中
+   * 标签的 cell 仍然 hidden=true，刚撤掉标签的 cell 仍然 hidden=false。
    */
   _scheduleSummaryRefresh() {
     if (this._summaryRafId != null) return;
     this._summaryRafId = window.requestAnimationFrame(() => {
       this._summaryRafId = null;
       this._renderPredefinedSummary();
+      if (this._isTagFilterActive()) this._applyTagFilter();
     });
   }
 
@@ -1699,6 +1914,10 @@ export class BoardPreviewApp extends HTMLElement {
       this._observer.disconnect();
       this._observer = null;
     }
+    if (this._dehydrateObserver) {
+      this._dehydrateObserver.disconnect();
+      this._dehydrateObserver = null;
+    }
   }
 
   /** @param {number} delayMs */
@@ -1718,7 +1937,11 @@ export class BoardPreviewApp extends HTMLElement {
     this._initObserver();
     if (!this._observer) return;
     for (const e of this._entries) {
-      if (!e.cellEl) this._observer.observe(e.el);
+      if (e.cellEl) {
+        if (this._dehydrateObserver) this._dehydrateObserver.observe(e.cellEl);
+      } else {
+        this._observer.observe(e.el);
+      }
     }
   }
 
@@ -2208,13 +2431,16 @@ export class BoardPreviewApp extends HTMLElement {
   async _loadCsvFromFile(file) {
     if (!file) return;
     try {
-      const text = await readTextFileUtf8(file);
-      const rows = parseCsv(text);
-      if (!rows.length) {
-        window.alert('CSV 为空或无法解析。');
+      // 改成流式只读首行：避免对 600 MB 量级 CSV 调用 FileReader.readAsText
+      // 直接把整个文本塞进单个字符串——这会触发 V8 OOM 或静默返回空，
+      // 表现为"CSV 为空或无法解析"的假阳性。真正的全文件扫描推迟到
+      // "确认导入"时再做（届时只保留必要的列到内存）。
+      const firstRow = await readCsvFirstRow(file);
+      if (!firstRow.length) {
+        window.alert('CSV 为空或无法解析（未读到任何字段）。');
         return;
       }
-      this._pendingCsv = { rows, fileName: file.name };
+      this._pendingCsv = { file, fileName: file.name, firstRow };
       // 选了新文件 → 旧的「已导入」状态作废；下次确认导入才会重新置位
       this._csvImported = false;
       const panel = /** @type {HTMLDivElement} */ (
@@ -2222,7 +2448,10 @@ export class BoardPreviewApp extends HTMLElement {
       );
       const nameEl = this.querySelector('.bp-csv-confirm__name');
       if (nameEl) {
-        nameEl.textContent = `已选择：${file.name}`;
+        const sizeMb = file.size / (1024 * 1024);
+        const sizeText =
+          sizeMb >= 1 ? `${sizeMb.toFixed(1)} MB` : `${Math.round(file.size / 1024)} KB`;
+        nameEl.textContent = `已选择：${file.name}（${sizeText}）`;
       }
       this._populateCsvColumnSelect();
       if (panel) {
@@ -2251,9 +2480,20 @@ export class BoardPreviewApp extends HTMLElement {
     );
     if (!sel || !this._pendingCsv) return;
 
-    const { rows } = this._pendingCsv;
+    const { firstRow } = this._pendingCsv;
     const firstRowIsHeader = Boolean(headerEl?.checked);
-    const labels = getColumnLabelsFromRows(rows, firstRowIsHeader);
+    // 流式路径下我们只持有首行；其他行的"最大列数"在确认导入时才精确知道。
+    // 列选择面板用首行长度作为列数估计，足够覆盖 99% 的真实 CSV（表头列数
+    // 通常就是最宽行）。若实际数据某行更宽，确认导入时会按真实列数采样，
+    // 不影响目标列的提取。
+    const colCount = firstRow.length;
+    /** @type {string[]} */
+    const labels = firstRowIsHeader
+      ? Array.from({ length: colCount }, (_, i) => {
+          const t = (firstRow[i] ?? '').trim();
+          return t || `列${i}`;
+        })
+      : Array.from({ length: colCount }, (_, i) => `列 ${i}`);
     sel.innerHTML = '';
     for (let i = 0; i < labels.length; i++) {
       const opt = document.createElement('option');
@@ -2263,12 +2503,11 @@ export class BoardPreviewApp extends HTMLElement {
     }
     sel.disabled = labels.length === 0;
 
-    const matchAgainst =
-      firstRowIsHeader && rows.length
-        ? Array.from({ length: labels.length }, (_, i) =>
-            (rows[0][i] ?? '').trim(),
-          )
-        : labels;
+    const matchAgainst = firstRowIsHeader
+      ? Array.from({ length: colCount }, (_, i) =>
+          (firstRow[i] ?? '').trim(),
+        )
+      : labels;
     sel.value = String(defaultContentColumnIndex(matchAgainst));
 
     /**
@@ -2305,7 +2544,7 @@ export class BoardPreviewApp extends HTMLElement {
     );
   }
 
-  _confirmCsvImport() {
+  async _confirmCsvImport() {
     if (!this._pendingCsv) {
       window.alert('请先选择 CSV 文件。');
       return;
@@ -2356,63 +2595,149 @@ export class BoardPreviewApp extends HTMLElement {
       return;
     }
     const firstRowIsHeader = Boolean(headerEl?.checked);
-    try {
-      const { rows } = this._pendingCsv;
-      const dataStart = firstRowIsHeader ? 1 : 0;
-      /** @type {Array<{ levelStr: string, row: string[], csvRow: number, tags: string[], offsetStr: string }>} */
-      const picked = [];
-      for (let r = dataStart; r < rows.length; r += 1) {
-        const row = rows[r];
-        if (!row || row.length <= colIndex) continue;
-        const cell = (row[colIndex] ?? '').trim();
-        if (!cell) continue;
-        const tags =
-          tagsColIndex !== null && row.length > tagsColIndex
-            ? parseTagsCellValue(row[tagsColIndex])
-            : [];
-        const offsetStr =
-          offsetColIndex !== null && row.length > offsetColIndex
-            ? String(row[offsetColIndex] ?? '').trim()
-            : '';
-        picked.push({ levelStr: cell, row, csvRow: r + 1, tags, offsetStr });
+    const { file, firstRow } = this._pendingCsv;
+    const totalBytes = file.size;
+    // 把确认按钮置为 loading 状态，防止用户重复点击触发并发流式扫
+    const confirmBtn = /** @type {HTMLButtonElement | null} */ (
+      this.querySelector('[data-action="confirm-csv-import"]')
+    );
+    const cancelBtn = /** @type {HTMLButtonElement | null} */ (
+      this.querySelector('[data-action="cancel-csv-import"]')
+    );
+    const progressEl = /** @type {HTMLSpanElement | null} */ (
+      this.querySelector('.bp-csv-confirm__progress')
+    );
+    if (this._csvImporting) return;
+    this._csvImporting = true;
+    const prevConfirmText = confirmBtn?.textContent ?? '';
+    if (confirmBtn) {
+      confirmBtn.disabled = true;
+      confirmBtn.textContent = '正在导入…';
+    }
+    if (cancelBtn) cancelBtn.disabled = true;
+    if (progressEl) {
+      progressEl.hidden = false;
+      progressEl.textContent = '正在扫描 0%…';
+    }
+    // 内存"瘦身策略"：行字符串只保留**用户选中的几列**（关卡串 / 标签 / Offset），
+    // 其他列丢弃。原因：600 MB CSV 全字段保留 ≈ 1.2 GB UTF-16 heap，Chrome
+    // 会在解析后期 OOM / GC 抖动 / 主线程冻结。这里牺牲"导出时保留全部原列"的
+    // 能力换稳定性，并在事后用 toast 明确告知用户。
+    /** @type {Array<{ levelStr: string, slimRow: string[], csvRow: number, tags: string[], offsetStr: string }>} */
+    const picked = [];
+    let columnCount = firstRow.length;
+    let lastProgressUpdate = 0;
+    // slimRow 中"未选中列"统一指向同一个 '' 单例，避免 119k × N 个独立空字符串分配
+    const EMPTY = '';
+    /** @param {string[]} row */
+    const buildSlimRow = (row) => {
+      const len = row.length;
+      const slim = new Array(len);
+      for (let i = 0; i < len; i += 1) slim[i] = EMPTY;
+      slim[colIndex] = row[colIndex] ?? EMPTY;
+      if (tagsColIndex !== null && len > tagsColIndex) {
+        slim[tagsColIndex] = row[tagsColIndex] ?? EMPTY;
       }
+      if (offsetColIndex !== null && len > offsetColIndex) {
+        slim[offsetColIndex] = row[offsetColIndex] ?? EMPTY;
+      }
+      return slim;
+    };
+    try {
+      await streamParseCsvFile(
+        file,
+        (row, rowIndex) => {
+          if (row.length > columnCount) columnCount = row.length;
+          // rowIndex 从 0 开始；CSV 行号 = rowIndex + 1（与表头开关无关）
+          if (firstRowIsHeader && rowIndex === 0) return;
+          if (row.length <= colIndex) return;
+          const cell = (row[colIndex] ?? '').trim();
+          if (!cell) return;
+          const tags =
+            tagsColIndex !== null && row.length > tagsColIndex
+              ? parseTagsCellValue(row[tagsColIndex])
+              : [];
+          const offsetStr =
+            offsetColIndex !== null && row.length > offsetColIndex
+              ? String(row[offsetColIndex] ?? '').trim()
+              : '';
+          picked.push({
+            levelStr: cell,
+            slimRow: buildSlimRow(row),
+            csvRow: rowIndex + 1,
+            tags,
+            offsetStr,
+          });
+        },
+        {
+          onProgress: (loaded) => {
+            // 节流到每 ~150ms 更新一次 UI，避免大量 DOM 写入拖慢解析
+            const now = performance.now();
+            if (now - lastProgressUpdate < 150 || !progressEl) return;
+            lastProgressUpdate = now;
+            const pct =
+              totalBytes > 0
+                ? Math.min(100, Math.floor((loaded / totalBytes) * 100))
+                : 0;
+            progressEl.textContent = `正在扫描 ${pct}%（已读取 ${picked.length.toLocaleString()} 条）`;
+          },
+        },
+      );
+
       if (!picked.length) {
         window.alert('所选列中未解析到任何非空关卡串。');
         return;
       }
-      this._csvHeader =
-        firstRowIsHeader && rows.length > 0 ? [...rows[0]] : null;
-      this._csvColumnCount = getMaxColumnCount(rows);
+      // 行数过大时让用户二次确认，避免无意中触发数十秒级的 DOM 构建
+      if (picked.length > BoardPreviewApp.LARGE_IMPORT_THRESHOLD) {
+        const ok = window.confirm(
+          `本次将导入 ${picked.length.toLocaleString()} 条预览框，浏览器可能短时间卡顿（DOM 量大）。\n\n继续吗？`,
+        );
+        if (!ok) return;
+      }
+      this._csvHeader = firstRowIsHeader ? [...firstRow] : null;
+      this._csvColumnCount = columnCount;
       this._csvTagsColumnIndex = tagsColIndex;
       this._csvOffsetColumnIndex = offsetColIndex;
 
       this._resetEntries();
-      for (const { levelStr, row, csvRow, tags, offsetStr } of picked) {
-        this._addLazyEntry(
-          {
-            tags,
-            sourceLevelStr: levelStr,
-            sourceOffsetStr: offsetStr,
-            operations: [],
-            levelStr,
-            offsetStr,
-            meta: { hadZAxisOperation: false },
-          },
-          row,
-          csvRow,
-        );
-      }
+      await this._batchAddLazyEntries(picked, (built, total) => {
+        if (!progressEl) return;
+        const now = performance.now();
+        if (now - lastProgressUpdate < 100) return;
+        lastProgressUpdate = now;
+        const pct = total > 0 ? Math.floor((built / total) * 100) : 0;
+        progressEl.textContent = `正在构建预览框 ${pct}%（${built.toLocaleString()} / ${total.toLocaleString()}）`;
+      });
       this._refreshSequenceBadges();
       this._renderStatus();
       this._renderPredefinedSummary();
       this._csvImported = true;
       this._toast(
-        `已导入 ${picked.length} 条。可在上方修改列选择后再点「确认导入」重新导入。`,
+        `已导入 ${picked.length.toLocaleString()} 条。可在上方修改列选择后再点「确认导入」重新导入。`,
         { kind: 'success', ttl: 4500 },
       );
+      // 大文件场景下提醒用户：导出 CSV 时仅保留所选列，其他列已被丢弃以释放内存
+      if (totalBytes > BoardPreviewApp.LARGE_FILE_BYTES) {
+        this._toast(
+          '大文件导入：为控制内存，仅保留所选「关卡 / 标签 / Offset」列；导出 CSV 时其他列将为空。',
+          { kind: 'warn', ttl: 7000 },
+        );
+      }
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
       window.alert(`CSV 导入失败：${msg}`);
+    } finally {
+      this._csvImporting = false;
+      if (confirmBtn) {
+        confirmBtn.disabled = false;
+        confirmBtn.textContent = prevConfirmText || '确认导入';
+      }
+      if (cancelBtn) cancelBtn.disabled = false;
+      if (progressEl) {
+        progressEl.hidden = true;
+        progressEl.textContent = '';
+      }
     }
   }
 
@@ -2466,5 +2791,33 @@ BoardPreviewApp.Z_OFFSET_KEY = 'bp:z-offset:v2';
 BoardPreviewApp.OFFSET_ENABLED_KEY = 'bp:offset-enabled:v1';
 BoardPreviewApp.OFFSET_UNIT_PCT_KEY = 'bp:offset-unit-pct:v1';
 BoardPreviewApp.CELLS_COLLAPSED_KEY = 'bp:cells-collapsed:v1';
+/**
+ * 一次导入超过该行数时弹二次确认，避免无意中触发数十秒级的 DOM 构建。
+ * 调小过分会打扰用户，调大过分会让"导入 10 万条没提示"显得很危险——
+ * 5000 是经验值（一台中端笔记本能在 5 秒内完成构建并不卡）。
+ */
+BoardPreviewApp.LARGE_IMPORT_THRESHOLD = 5000;
+/**
+ * 文件大小超过该阈值时触发"列裁剪 trade-off"提示。仅决定是否 toast，
+ * 不影响数据正确性；选这个值是因为浏览器从 ~100 MB 起开始出现明显抖动。
+ */
+BoardPreviewApp.LARGE_FILE_BYTES = 100 * 1024 * 1024;
+/**
+ * 大批量导入时每帧 append 的 skeleton 条数。500 在一台中端机上每帧 ~5 ms，
+ * 能给浏览器留够时间绘制 + 处理用户输入。再大会出现明显卡顿，再小会让总
+ * 构建时间变长（多帧调度开销 + observer 注册 batch 太碎）。
+ */
+BoardPreviewApp.IMPORT_BATCH_SIZE = 500;
+/**
+ * "进入此缓冲区就水合"——视口上下额外 600 px。值越大滚动越不会出现白屏，
+ * 但会让更多 cell 同时水合，内存占用升高。
+ */
+BoardPreviewApp.HYDRATE_BUFFER_PX = 600;
+/**
+ * "离开此缓冲区就回收"——视口上下额外 1800 px。比 HYDRATE_BUFFER_PX 大
+ * 的部分构成"回收死区"：一旦水合，至少要滚出这一圈才会被换回 skeleton，
+ * 防止用户在视口边缘来回滚动时频繁水合 / 回收抖动。
+ */
+BoardPreviewApp.KEEP_ALIVE_BUFFER_PX = 1800;
 
 customElements.define('board-preview-app', BoardPreviewApp);

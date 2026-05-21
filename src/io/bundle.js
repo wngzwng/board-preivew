@@ -90,6 +90,11 @@ export function serializeExportBundle(items) {
 }
 
 /**
+ * 一次性读整个文件为 UTF-8 文本——**仅适用于小文件**（数十 MB 以内）。
+ *
+ * 浏览器 / V8 在数百 MB 字符串上会 OOM 或静默返回空，触发"CSV 为空或无法解析"
+ * 等假阳性错误。大 CSV 路径请改用 {@link streamTextFileUtf8}。
+ *
  * @param {File} file
  * @returns {Promise<string>}
  */
@@ -106,6 +111,90 @@ export async function readTextFileUtf8(file) {
     reader.onerror = () => reject(reader.error ?? new Error('读取失败'));
     reader.readAsText(file, 'UTF-8');
   });
+}
+
+/**
+ * 流式把文件按 UTF-8 解码为文本 chunk，喂给回调。
+ *
+ * 内部用 `File.stream() → TextDecoderStream` 异步迭代，**不**把整个文件放进单个
+ * 字符串——内存峰值取决于 chunk 大小（浏览器实现，通常 ~64 KB / chunk）+
+ * 调用方在回调里持有的状态。
+ *
+ * 适用场景：
+ * - 大 CSV（数百 MB ~ GB）的流式解析；
+ * - 进度回显（onProgress 给出"已读字节数 / 总字节数"）；
+ * - 可取消（AbortSignal）。
+ *
+ * 错误传播：reader / decoder 抛错或被取消时，整个 Promise 拒绝。
+ *
+ * @param {File} file
+ * @param {(chunk: string) => void | Promise<void>} onChunk
+ * @param {{
+ *   onProgress?: (loaded: number, total: number) => void,
+ *   signal?: AbortSignal,
+ * }} [options]
+ * @returns {Promise<void>}
+ */
+export async function streamTextFileUtf8(file, onChunk, options = {}) {
+  const { onProgress, signal } = options;
+  if (signal?.aborted) {
+    throw new DOMException('已取消', 'AbortError');
+  }
+  const total = file.size;
+  // 优先使用 TextDecoderStream（更省内存），不支持时回退到手动 TextDecoder。
+  const supportsTextDecoderStream = typeof TextDecoderStream !== 'undefined';
+  let loaded = 0;
+
+  if (supportsTextDecoderStream) {
+    const stream = file.stream().pipeThrough(new TextDecoderStream('utf-8'));
+    const reader = stream.getReader();
+    try {
+      while (true) {
+        if (signal?.aborted) {
+          await reader.cancel();
+          throw new DOMException('已取消', 'AbortError');
+        }
+        const { value, done } = await reader.read();
+        if (done) break;
+        if (value) {
+          // TextDecoderStream 不直接给出"字节"进度，按 UTF-8 估算
+          loaded += value.length; // 粗略：进度条用，不要求精确字节
+          await onChunk(value);
+          onProgress?.(Math.min(loaded, total), total);
+        }
+      }
+    } finally {
+      reader.releaseLock();
+    }
+    return;
+  }
+
+  // 回退：手动跑 ReadableStream<Uint8Array> + TextDecoder，注意保留 stream=true
+  // 以正确处理跨 chunk 的 UTF-8 多字节序列。
+  const reader = file.stream().getReader();
+  const decoder = new TextDecoder('utf-8');
+  try {
+    while (true) {
+      if (signal?.aborted) {
+        await reader.cancel();
+        throw new DOMException('已取消', 'AbortError');
+      }
+      const { value, done } = await reader.read();
+      if (done) {
+        const tail = decoder.decode();
+        if (tail) await onChunk(tail);
+        break;
+      }
+      if (value) {
+        loaded += value.byteLength;
+        const text = decoder.decode(value, { stream: true });
+        if (text) await onChunk(text);
+        onProgress?.(loaded, total);
+      }
+    }
+  } finally {
+    reader.releaseLock();
+  }
 }
 
 /**
